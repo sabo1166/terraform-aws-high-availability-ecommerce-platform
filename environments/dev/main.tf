@@ -86,6 +86,8 @@ module "alb" {
   access_logs_bucket_name        = module.logging.alb_logs_bucket_name
   enable_origin_verification     = true
   origin_verify_header_value     = var.origin_verify_header_value
+  frontend_health_check_path     = var.frontend_health_check_path
+  backend_health_check_path      = var.backend_health_check_path
 
   depends_on = [module.logging]
 }

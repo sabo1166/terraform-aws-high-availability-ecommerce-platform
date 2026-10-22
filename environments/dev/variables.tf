@@ -174,3 +174,18 @@ variable "asg_wait_for_capacity_timeout" {
   type        = string
   default     = "0"
 }
+
+## Load balancer health-check paths. Both tiers of the Oriel application answer /healthz without touching
+## the database (Nginx on the frontend, the Fastify API on the backend), so a database outage does not make
+## the load balancer replace healthy instances. They only become meaningful once the application is deployed.
+variable "frontend_health_check_path" {
+  description = "Health-check path for the frontend target group."
+  type        = string
+  default     = "/healthz"
+}
+
+variable "backend_health_check_path" {
+  description = "Health-check path for the backend target group."
+  type        = string
+  default     = "/healthz"
+}
