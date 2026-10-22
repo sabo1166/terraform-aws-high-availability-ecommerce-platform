@@ -1,10 +1,18 @@
-name: Application
+name: Application CI
 
-## Tests and production builds for application/frontend and application/backend.
-## The backend job also runs the MySQL store tests against a throwaway MySQL service container.
-## Application deployment is NOT implemented: the Terraform resources define no way to deliver code to
-## the private instances (see docs/runbooks/application-deployment.md). The optional infrastructure
-## check below only reads Terraform outputs and Auto Scaling Group health; it deploys nothing.
+## Continuous integration for the Oriel Node.js/React application (application/frontend, application/backend).
+##
+## Jobs:
+##   frontend-ci            install, test, production build, upload the build output
+##   backend-ci             MySQL 8 service, install, type check, tests (including the MySQL contract
+##                          tests), production build, upload the build output
+##   infrastructure-check   OPTIONAL, manual only (input check_infrastructure): read-only check of the
+##                          deployed Auto Scaling Groups. It never creates, changes, or deletes anything.
+##   ci-summary             always runs; writes the step summary and fails if a required job failed
+##
+## Application deployment is NOT implemented: the Terraform resources define no way to deliver code to the
+## private instances (see docs/runbooks/application-deployment.md). Nothing in this workflow deploys.
+## Terraform deployment lives in the separate terraform.yml.
 on:
   pull_request:
     paths:
@@ -29,52 +37,72 @@ concurrency:
   group: application-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
+## Fail fast inside every script step (errexit and pipefail).
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  frontend:
-    name: Frontend tests and build
+  frontend-ci:
+    name: "Frontend CI (test, build)"
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     defaults:
       run:
+        shell: bash
         working-directory: application/frontend
     steps:
-      - name: Check out
+      - name: "1. Check out the repository"
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Set up Node.js
+      - name: "2. Set up Node.js (version from application/frontend/.nvmrc)"
         uses: actions/setup-node@v4
         with:
           node-version-file: application/frontend/.nvmrc
           cache: npm
           cache-dependency-path: application/frontend/package-lock.json
 
-      - name: Install dependencies
+      - name: "3. Show tool versions"
+        run: |
+          echo "node $(node --version), npm $(npm --version)"
+
+      - name: "4. Install dependencies (npm ci, lockfile only)"
         run: npm ci
 
-      - name: Test
+      - name: "5. Run frontend tests"
         run: npm test
 
-      - name: Production build (type check + bundle)
+      - name: "6. Production build (type check + bundle)"
         run: npm run build
 
-      - name: Upload build output
+      - name: "7. Verify the build output exists"
+        run: |
+          if [ ! -f dist/index.html ] || [ -z "$(ls -A dist/assets 2>/dev/null)" ]; then
+            echo "::error title=Frontend build output missing::application/frontend/dist/index.html or dist/assets is missing or empty after 'npm run build'."
+            exit 1
+          fi
+          echo "Build output: $(find dist -type f | wc -l) files, $(du -sh dist | cut -f1)"
+
+      - name: "8. Upload the frontend build artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: frontend-dist-${{ github.sha }}
+          name: frontend-dist-${{ github.sha }}-${{ github.run_attempt }}
           path: application/frontend/dist
           retention-days: 7
           if-no-files-found: error
 
-  backend:
-    name: Backend tests and build
+  backend-ci:
+    name: "Backend CI (MySQL 8, type check, test, build)"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
       run:
+        shell: bash
         working-directory: application/backend
-    ## A throwaway database for the MySQL store contract tests; it exists only for this job.
+    ## A throwaway database for the MySQL store contract tests; it exists only for this job and uses an
+    ## empty root password because nothing outside the job can reach it.
     services:
       mysql:
         image: mysql:8.0
@@ -95,34 +123,100 @@ jobs:
       MYSQL_TEST_PASSWORD: ""
       MYSQL_TEST_DATABASE: oriel_test
     steps:
-      - name: Check out
+      - name: "1. Check out the repository"
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Set up Node.js
+      - name: "2. Set up Node.js (version from application/backend/.nvmrc)"
         uses: actions/setup-node@v4
         with:
           node-version-file: application/backend/.nvmrc
           cache: npm
           cache-dependency-path: application/backend/package-lock.json
 
-      - name: Install dependencies
+      - name: "3. Show tool versions"
+        run: |
+          echo "node $(node --version), npm $(npm --version)"
+
+      - name: "4. Confirm the MySQL service is reachable"
+        run: |
+          for attempt in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/3306) 2>/dev/null; then
+              echo "MySQL is accepting connections on 127.0.0.1:3306 (attempt ${attempt})"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error title=MySQL service not reachable::The mysql:8.0 service container did not accept connections on 127.0.0.1:3306 within 60 seconds. Check the 'Initialize containers' step of this job."
+          exit 1
+
+      - name: "5. Install dependencies (npm ci, lockfile only)"
         run: npm ci
 
-      - name: Type check
+      - name: "6. Type check"
         run: npm run typecheck
 
-      - name: Test (including MySQL store contract tests)
-        run: npm test
+      ## The JSON report is written next to the console output so the next step can prove that the MySQL
+      ## contract tests really ran instead of being skipped.
+      - name: "7. Run backend tests (including MySQL contract tests)"
+        run: npm test -- --reporter=default --reporter=json --outputFile.json=test-results.json
 
-      - name: Production build
+      ## Fail-closed guard. It requires that the MySQL contract tests exist, all passed, and nothing was
+      ## skipped. Note: when MySQL is unreachable the tests are reported as "skipped" together with a failed
+      ## suite, so the failed-suite check is part of the guard, not only the skipped count.
+      - name: "8. Verify the MySQL contract tests actually ran and passed"
+        run: |
+          node -e '
+            const r = require("./test-results.json");
+            const all = r.testResults.flatMap((f) => f.assertionResults);
+            const mysql = all.filter((a) => a.ancestorTitles.some((t) => t.includes("MysqlStore")));
+            const mysqlPassed = mysql.filter((a) => a.status === "passed").length;
+            console.log(`total=${r.numTotalTests} passed=${r.numPassedTests} failed=${r.numFailedTests} skipped=${r.numPendingTests} failedSuites=${r.numFailedTestSuites} mysqlContract=${mysqlPassed}/${mysql.length}`);
+            const problems = [];
+            if (!r.success || r.numFailedTestSuites > 0) problems.push("the test run did not succeed (a failed test or suite, for example the MySQL setup in beforeAll)");
+            if (mysql.length === 0) problems.push("no MySQL contract tests were found in the report (renamed or removed?)");
+            if (mysqlPassed !== mysql.length) problems.push((mysql.length - mysqlPassed) + " MySQL contract test(s) did not pass");
+            if (r.numPendingTests > 0) problems.push(r.numPendingTests + " test(s) were skipped (MYSQL_TEST_* unset or invalid, or a skipped/todo test)");
+            if (problems.length > 0) {
+              console.log("::error title=Backend test guard failed::" + problems.join("; "));
+              process.exit(1);
+            }
+          '
+
+      - name: "9. Add the test results to the job summary"
+        if: ${{ always() }}
+        run: |
+          if [ -f test-results.json ]; then
+            node -e '
+              const r = require("./test-results.json");
+              const mysql = r.testResults.flatMap((f) => f.assertionResults).filter((a) => a.ancestorTitles.some((t) => t.includes("MysqlStore")));
+              const row = [r.numTotalTests, r.numPassedTests, r.numFailedTests, r.numFailedTestSuites, r.numPendingTests, mysql.filter((a) => a.status === "passed").length + "/" + mysql.length];
+              console.log("### Backend tests\n\n| Total | Passed | Failed tests | Failed suites | Skipped | MySQL contract passed |\n| --- | --- | --- | --- | --- | --- |\n| " + row.join(" | ") + " |");
+            ' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No test report was produced (the test step did not finish)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: "10. Production build"
         run: npm run build
 
-      - name: Upload build output
+      - name: "11. Verify the build output exists"
+        run: |
+          missing=0
+          for f in dist/server.js dist/db/migrate.js dist/db/migrations/001_init.sql; do
+            if [ ! -f "$f" ]; then
+              echo "::error title=Backend build output missing::application/backend/$f was not produced by 'npm run build'."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+          echo "Build output: $(find dist -type f | wc -l) files"
+
+      - name: "12. Upload the backend build artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: backend-dist-${{ github.sha }}
+          name: backend-dist-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             application/backend/dist
             application/backend/package.json
@@ -130,60 +224,94 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  ## Read-only: confirms the infrastructure that would receive a deployment is up. Requires the
-  ## remote state and AWS access keys in the repository secrets AWS_ACCESS_KEY_ID and
-  ## AWS_SECRET_ACCESS_KEY (see docs/runbooks/ci-cd.md); none exist yet. This job has no GitHub
-  ## Environment, so it uses the same repository-level keys as the Terraform plan identity.
+  ## Optional and read-only. Skipped (not failed) unless the manual input is enabled. Requires the remote
+  ## state and AWS access keys in the repository secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (see
+  ## docs/runbooks/ci-cd.md); none exist yet. No GitHub Environment is used, so these are the same
+  ## repository-level keys as the Terraform plan identity. Only reads: terraform init (backend read),
+  ## terraform output, and autoscaling:DescribeAutoScalingGroups.
   infrastructure-check:
-    name: Infrastructure health check
-    needs: [frontend, backend]
+    name: "Infrastructure check (optional, read-only)"
+    needs: [frontend-ci, backend-ci]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_infrastructure }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - name: Check out
+      ## Names only: values are never printed, and missing items are all listed in one message.
+      - name: "1. Validate the required configuration"
+        env:
+          HAS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+          HAS_REGION: ${{ vars.AWS_REGION != '' }}
+          HAS_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET != '' }}
+          HAS_STATE_REGION: ${{ vars.TF_STATE_REGION != '' }}
+        run: |
+          missing=()
+          [ "$HAS_ACCESS_KEY" = "true" ] || missing+=("secret AWS_ACCESS_KEY_ID")
+          [ "$HAS_SECRET_KEY" = "true" ] || missing+=("secret AWS_SECRET_ACCESS_KEY")
+          [ "$HAS_REGION" = "true" ] || missing+=("variable AWS_REGION")
+          [ "$HAS_STATE_BUCKET" = "true" ] || missing+=("variable TF_STATE_BUCKET")
+          [ "$HAS_STATE_REGION" = "true" ] || missing+=("variable TF_STATE_REGION")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Missing configuration::Not set: ${missing[*]}. See docs/runbooks/ci-cd.md and bootstrap/README.md."
+            exit 1
+          fi
+          echo "All required secrets and variables are set (values not shown)."
+
+      - name: "2. Check out the repository"
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Set up Terraform
+      - name: "3. Set up Terraform"
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "^1.10.0"
           terraform_wrapper: false
 
-      ## Only reads the state bucket and describes Auto Scaling Groups; the keys are never echoed.
-      - name: Configure AWS credentials (access keys)
+      - name: "4. Configure AWS credentials (access keys, read-only use)"
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Initialize remote backend (read outputs only)
+      - name: "5. Confirm AWS accepts the credentials (identity is not printed)"
+        run: |
+          if aws sts get-caller-identity --query Account --output text > /dev/null 2>&1; then
+            echo "AWS accepted the credentials."
+          else
+            echo "::error title=AWS rejected the credentials::Check that the access keys are active and belong to the intended IAM user."
+            exit 1
+          fi
+
+      - name: "6. Initialise the S3 backend (read-only use)"
         working-directory: environments/dev
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
           STATE_REGION: ${{ vars.TF_STATE_REGION }}
         run: |
-          if [ -z "$STATE_BUCKET" ] || [ -z "$STATE_REGION" ]; then
-            echo "::error::TF_STATE_BUCKET and TF_STATE_REGION are not set; the infrastructure has not been bootstrapped."
+          cp backend.tf.example backend.tf
+          if ! terraform init -input=false \
+              -backend-config="bucket=${STATE_BUCKET}" \
+              -backend-config="region=${STATE_REGION}"; then
+            echo "::error title=Backend initialisation failed::Check that the state bucket exists, TF_STATE_REGION matches its region, and the IAM user may read it (bootstrap/README.md)."
             exit 1
           fi
-          cp backend.tf.example backend.tf
-          terraform init -input=false \
-            -backend-config="bucket=${STATE_BUCKET}" \
-            -backend-config="region=${STATE_REGION}"
 
       ## Uses the real Terraform outputs frontend_asg_name and backend_asg_name. The ASGs use ELB health
       ## checks, so an instance reported Healthy here has passed its load balancer health check.
-      - name: Verify both Auto Scaling Groups are in service and healthy
+      - name: "7. Verify both Auto Scaling Groups are in service and healthy"
         working-directory: environments/dev
         run: |
+          failed=0
           for output in frontend_asg_name backend_asg_name; do
-            ASG="$(terraform output -raw "$output")"
+            if ! ASG="$(terraform output -raw "$output" 2>/dev/null)" || [ -z "$ASG" ]; then
+              echo "::error title=Terraform output missing::Output '${output}' is not in the remote state. Has the dev stack been applied?"
+              failed=1
+              continue
+            fi
             TOTAL="$(aws autoscaling describe-auto-scaling-groups \
               --auto-scaling-group-names "$ASG" \
               --query 'length(AutoScalingGroups[0].Instances)' --output text)"
@@ -193,7 +321,57 @@ jobs:
               --output text)"
             echo "${output}: ${HEALTHY}/${TOTAL} instance(s) in service and healthy"
             if [ "$TOTAL" = "None" ] || [ "$TOTAL" -lt 1 ] || [ "$HEALTHY" != "$TOTAL" ]; then
-              echo "::error::${output} is not fully healthy."
-              exit 1
+              echo "::error title=Auto Scaling Group not healthy::${output} has ${HEALTHY}/${TOTAL} healthy in-service instances."
+              failed=1
             fi
           done
+          [ "$failed" -eq 0 ]
+
+  ## Always runs, so the run has one clear verdict. Frontend and backend CI are required; the optional
+  ## infrastructure check may be skipped but must not have failed or been cancelled.
+  ci-summary:
+    name: CI Summary
+    needs: [frontend-ci, backend-ci, infrastructure-check]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: "Report results and fail if required CI did not pass"
+        env:
+          FRONTEND_RESULT: ${{ needs.frontend-ci.result }}
+          BACKEND_RESULT: ${{ needs.backend-ci.result }}
+          INFRA_RESULT: ${{ needs.infrastructure-check.result }}
+        run: |
+          {
+            echo "## CI Summary"
+            echo
+            echo "| Job | Result | Required |"
+            echo "| --- | --- | --- |"
+            echo "| Frontend CI | ${FRONTEND_RESULT} | yes |"
+            echo "| Backend CI | ${BACKEND_RESULT} | yes |"
+            echo "| Infrastructure check | ${INFRA_RESULT} | no (optional, manual) |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\`. Nothing was deployed by this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          for pair in "Frontend CI:${FRONTEND_RESULT}" "Backend CI:${BACKEND_RESULT}"; do
+            name="${pair%%:*}"; result="${pair#*:}"
+            if [ "$result" != "success" ]; then
+              echo "::error title=${name} did not pass::Result: ${result}. Open the '${name}' job to see the failed step."
+              failed=1
+            fi
+          done
+          case "$INFRA_RESULT" in
+            success|skipped) ;;
+            *)
+              echo "::error title=Infrastructure check did not pass::Result: ${INFRA_RESULT}. Open the 'Infrastructure check' job to see the failed step."
+              failed=1
+              ;;
+          esac
+          if [ "$failed" -ne 0 ]; then
+            echo "CI failed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All required CI jobs passed."

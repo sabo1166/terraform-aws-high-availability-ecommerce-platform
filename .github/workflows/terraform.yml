@@ -1,16 +1,23 @@
 name: Terraform
 
-## Validation runs on every pull request and push without AWS credentials. Infrastructure
-## deployment is manual (workflow_dispatch): a plan job, then an apply job that only runs when
-## "apply" is selected and a reviewer approves the protected "dev-apply" GitHub Environment.
-## Destroy is never run by this workflow. Required configuration: docs/runbooks/ci-cd.md.
+## Pull requests and pushes run an offline validation job (no AWS credentials, no backend).
+## Infrastructure deployment is manual (workflow_dispatch) and runs these stages in this order:
+##   1. INIT      set up Terraform, configure AWS credentials, initialise the S3 backend   (plan job)
+##   2. VALIDATE  terraform fmt -check -recursive, then terraform validate (after a successful init)
+##   3. PLAN      terraform plan -out, deletion/replacement guard, encrypted plan artifact
+##   4. APPLY     apply exactly that saved plan                                            (apply job)
+## "apply" defaults to true, so a dispatch plans and then applies automatically. That is only
+## "automatic" if the GitHub Environment "dev-apply" has NO required reviewers and NO wait timer;
+## otherwise the apply job pauses for approval (see docs/runbooks/ci-cd.md). The apply job runs only
+## on the deployment branch (repository variable TF_DEPLOY_BRANCH, default "master"). Plans that delete
+## or replace resources fail unless "allow_deletions" is selected. Destroy is never run.
 ##
 ## AWS authentication uses static access keys (no OIDC), always read from the secrets
 ## AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. Access boundary between plan and apply:
 ##   - plan job: no GitHub Environment, so it reads the REPOSITORY-level secrets (the plan identity).
 ##   - apply job: runs in the "dev-apply" Environment; ENVIRONMENT-level secrets with the same names
-##     override the repository ones there, so the apply identity is only available to approved runs.
-## The validate job never uses AWS credentials.
+##     override the repository ones there, so the apply identity is only used by the apply job.
+## The offline validate job never uses AWS credentials.
 on:
   pull_request:
   push:
@@ -18,9 +25,9 @@ on:
   workflow_dispatch:
     inputs:
       apply:
-        description: "Apply the reviewed plan after Environment approval (otherwise plan only)"
+        description: "Apply the saved plan after the plan stage succeeds (uncheck for plan only). Pauses for approval only if the dev-apply Environment requires reviewers."
         type: boolean
-        default: false
+        default: true
       allow_deletions:
         description: "Allow a plan that deletes or replaces resources (otherwise the plan job fails)"
         type: boolean
@@ -41,8 +48,11 @@ env:
   WORKING_DIRECTORY: environments/dev
 
 jobs:
+  ## Offline gate for pull requests and pushes. Deployment runs (workflow_dispatch) validate inside the
+  ## plan job instead, after the backend has been initialised.
   validate:
     name: Format, validate, and test
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -86,8 +96,7 @@ jobs:
         run: python -B -m unittest discover -s modules/automation/tests -v
 
   plan:
-    name: Plan
-    needs: validate
+    name: Init, validate, and plan
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -100,7 +109,7 @@ jobs:
     steps:
       ## The remote state bucket comes from the bootstrap stack. Without it, stop here instead of
       ## falling back to local state.
-      - name: Require a bootstrapped remote state
+      - name: 1-pre. INIT - require a bootstrapped remote state
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
           STATE_REGION: ${{ vars.TF_STATE_REGION }}
@@ -115,7 +124,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Terraform
+      - name: 1a. INIT - set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "^1.10.0"
@@ -124,7 +133,7 @@ jobs:
       ## Plan identity: repository-level secrets. GitHub masks secret values in logs and the keys are
       ## never echoed by this workflow. Give this IAM user only what a plan needs (state access plus
       ## read access to refresh); it must not be the apply identity.
-      - name: Configure AWS credentials (plan keys)
+      - name: 1b. INIT - configure AWS credentials (plan keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -132,7 +141,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       ## backend.tf is created at run time from the committed example; the bucket name is not committed.
-      - name: Initialize remote backend
+      - name: 1c. INIT - initialise the S3 backend
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
@@ -143,8 +152,17 @@ jobs:
             -backend-config="bucket=${STATE_BUCKET}" \
             -backend-config="region=${STATE_REGION}"
 
+      ## VALIDATE only runs if every INIT step succeeded (a failed step skips all later steps).
+      ## Neither command creates or changes any AWS resource.
+      - name: 2a. VALIDATE - terraform fmt -check -recursive
+        run: terraform fmt -check -recursive
+
+      - name: 2b. VALIDATE - terraform validate
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: terraform validate
+
       ## A normal plan only: this workflow never uses -destroy.
-      - name: Terraform plan
+      - name: 3a. PLAN - terraform plan
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
@@ -155,7 +173,7 @@ jobs:
 
       ## Only resource addresses and actions are printed. Plan values (which can include the
       ## origin secret and other sensitive data) are never written to the log.
-      - name: Summarize plan (addresses and actions only)
+      - name: 3b. PLAN - summarise (addresses and actions only)
         working-directory: ${{ env.WORKING_DIRECTORY }}
         run: |
           {
@@ -170,7 +188,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       ## Deleting or replacing resources (including the database) needs an explicit opt-in.
-      - name: Block deletions unless allowed
+      - name: 3c. PLAN - block deletions and replacements unless allowed
         if: ${{ !inputs.allow_deletions }}
         working-directory: ${{ env.WORKING_DIRECTORY }}
         run: |
@@ -181,7 +199,7 @@ jobs:
           fi
 
       ## The saved plan can contain secrets, so it is encrypted before it becomes an artifact.
-      - name: Encrypt plan and record metadata
+      - name: 3d. PLAN - encrypt the plan and record metadata
         id: meta
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
@@ -195,7 +213,7 @@ jobs:
           echo "plan_sha256=${PLAN_SHA256}" >> "$GITHUB_OUTPUT"
           rm -f tfplan
 
-      - name: Upload encrypted plan
+      - name: 3e. PLAN - upload the encrypted plan
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
@@ -205,14 +223,32 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+      ## Makes a skipped apply visible instead of a silently green plan-only run.
+      - name: 3f. PLAN - state whether the apply stage will run
+        env:
+          APPLY_INPUT: ${{ inputs.apply }}
+          REF_NAME: ${{ github.ref_name }}
+          DEPLOY_BRANCH: ${{ vars.TF_DEPLOY_BRANCH || 'master' }}
+        run: |
+          if [ "$APPLY_INPUT" != "true" ]; then
+            echo "::notice::apply was not selected: this run planned only."
+          elif [ "$REF_NAME" != "$DEPLOY_BRANCH" ]; then
+            echo "::notice::branch '${REF_NAME}' is not the deployment branch '${DEPLOY_BRANCH}': the apply stage will be skipped."
+          else
+            echo "::notice::the apply stage will run next (it waits for approval only if the dev-apply Environment requires reviewers)."
+          fi
+
   apply:
-    name: Apply reviewed plan
+    name: Apply saved plan
     needs: plan
-    if: ${{ inputs.apply }}
+    ## Only on the deployment branch (repository variable TF_DEPLOY_BRANCH, default master), only when
+    ## "apply" is selected, and only after the whole plan job (init, validate, plan) succeeded.
+    if: ${{ inputs.apply && github.ref_name == (vars.TF_DEPLOY_BRANCH || 'master') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    ## Configure required reviewers (and a branch restriction) on this Environment in GitHub, and store
-    ## the apply identity's AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as ENVIRONMENT secrets here.
+    ## The "dev-apply" Environment holds the apply identity's AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as
+    ## ENVIRONMENT secrets. For automatic apply it must have NO required reviewers and NO wait timer (these
+    ## are GitHub settings, not workflow code); restrict its deployment branches to the deployment branch.
     environment: dev-apply
     permissions:
       contents: read
@@ -265,14 +301,14 @@ jobs:
       ## Apply identity: the dev-apply ENVIRONMENT secrets (same names as the repository secrets, which
       ## they override inside this job). If the Environment has no secrets of its own, GitHub silently
       ## falls back to the repository (plan) keys, which defeats the separation: confirm they are set.
-      - name: Configure AWS credentials (apply keys)
+      - name: 1b. INIT - configure AWS credentials (apply keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Initialize remote backend
+      - name: 1c. INIT - initialise the S3 backend
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
@@ -285,9 +321,9 @@ jobs:
 
       ## Applying the saved plan applies exactly what was reviewed; Terraform rejects it if the
       ## state changed since the plan was made. No variables are needed with a saved plan.
-      - name: Terraform apply (saved plan)
+      - name: 4. APPLY - Terraform auto-approve
         working-directory: ${{ env.WORKING_DIRECTORY }}
-        run: terraform apply -input=false -lock-timeout=5m tfplan
+        run: terraform apply -auto-approve -input=false -lock-timeout=5m tfplan
 
       - name: Remove plan files
         if: always()
