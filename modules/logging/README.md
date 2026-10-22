@@ -18,7 +18,7 @@ Status: statically validated only. It is not connected to `environments/dev`, th
 | Name | Description | Default |
 | --- | --- | --- |
 | `project_name`, `environment` | Naming and tags | required |
-| `alb_logs_bucket_name` | Globally unique bucket name | required |
+| `alb_logs_bucket_name` | Optional bucket name. When null or empty the name is `<project_name>-<environment>-alb-logs-<account id>-<region>` | `null` |
 | `alb_log_prefix` | Log prefix, no leading or trailing slash | `alb` |
 | `log_retention_days` | Access log expiry | `90` |
 | `athena_results_retention_days` | Query result expiry | `30` |

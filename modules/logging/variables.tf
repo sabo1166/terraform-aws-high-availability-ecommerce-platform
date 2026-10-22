@@ -9,13 +9,15 @@ variable "environment" {
   type        = string
 }
 
-## S3 bucket names are global; the caller must choose a unique name (no default on purpose).
+## S3 bucket names are global. When this is null or empty the module builds a unique name from the project,
+## the environment, the AWS account ID, and the region; set it only to choose a specific, unused name.
 variable "alb_logs_bucket_name" {
-  description = "Globally unique name of the S3 bucket that stores ALB access logs and Athena query results."
+  description = "Optional globally unique name of the S3 bucket that stores ALB access logs and Athena query results. Leave null to use <project>-<environment>-alb-logs-<account id>-<region>."
   type        = string
+  default     = null
 
   validation {
-    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.alb_logs_bucket_name))
+    condition     = var.alb_logs_bucket_name == null || trimspace(var.alb_logs_bucket_name) == "" || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", trimspace(var.alb_logs_bucket_name)))
     error_message = "Bucket name must be 3-63 characters: lowercase letters, numbers, dots, and hyphens, starting and ending with a letter or number."
   }
 }

@@ -135,7 +135,6 @@ jobs:
           HAS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
           DOMAIN_NAME_VAR: ${{ vars.DOMAIN_NAME }}
           HOSTED_ZONE_ID_VAR: ${{ vars.ROUTE53_HOSTED_ZONE_ID }}
-          ALB_LOGS_BUCKET_VAR: ${{ vars.ALB_LOGS_BUCKET_NAME }}
         run: |
           MISSING=""
           [ -n "$STATE_BUCKET" ] || MISSING="$MISSING TF_STATE_BUCKET"
@@ -145,7 +144,6 @@ jobs:
           [ "$HAS_SECRET_ACCESS_KEY" = "true" ] || MISSING="$MISSING AWS_SECRET_ACCESS_KEY"
           [ -n "$DOMAIN_NAME_VAR" ] || MISSING="$MISSING DOMAIN_NAME"
           [ -n "$HOSTED_ZONE_ID_VAR" ] || MISSING="$MISSING ROUTE53_HOSTED_ZONE_ID"
-          [ -n "$ALB_LOGS_BUCKET_VAR" ] || MISSING="$MISSING ALB_LOGS_BUCKET_NAME"
           if [ -n "$MISSING" ]; then
             echo "::error::Missing required settings:${MISSING}. Apply the bootstrap stack first and configure the variables and secrets (bootstrap/README.md, docs/runbooks/ci-cd.md)."
             exit 1
@@ -232,6 +230,7 @@ jobs:
       plan_prefix: ${{ steps.meta.outputs.plan_prefix }}
       commit_sha: ${{ steps.meta.outputs.commit_sha }}
       plan_sha256: ${{ steps.meta.outputs.plan_sha256 }}
+      build_sha256: ${{ steps.meta.outputs.build_sha256 }}
     steps:
       - name: Check out
         uses: actions/checkout@v7
@@ -274,7 +273,6 @@ jobs:
           TF_VAR_aws_region: ${{ vars.AWS_REGION }}
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_route53_hosted_zone_id: ${{ vars.ROUTE53_HOSTED_ZONE_ID }}
-          TF_VAR_alb_logs_bucket_name: ${{ vars.ALB_LOGS_BUCKET_NAME }}
         run: terraform plan -input=false -lock-timeout=5m -out=tfplan > /dev/null
 
       ## Only resource addresses and actions are printed. Plan values (which can include the
@@ -304,6 +302,11 @@ jobs:
             exit 1
           fi
 
+      ## The Lambda packages (modules/automation/build/*.zip) are written by the archive_file data sources while
+      ## the plan runs, and the saved plan refers to them by path and hash. The apply job runs on a fresh runner
+      ## that never ran the plan, so it would not have them (Terraform does not re-read data sources when it
+      ## applies a saved plan). They are therefore checked here and shipped to the apply job as one tar file
+      ## with their own SHA-256, so the bytes applied are exactly the bytes that were planned.
       ## The saved plan can contain secrets, so it goes only to the private state bucket, never to a GitHub
       ## artifact, and is never printed. Each object is uploaded with SSE-S3 requested explicitly and the
       ## stored encryption is read back, so a bucket that does not encrypt it fails the run. The commit SHA
@@ -316,10 +319,38 @@ jobs:
           STATE_REGION: ${{ vars.TF_STATE_REGION }}
           PLAN_PREFIX: ${{ env.PLAN_KEY_PREFIX }}/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
+          python3 - ../../modules/automation/build <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          build = pathlib.Path(sys.argv[1])
+          handlers = {"alarm_logger.zip": "alarm_logger.py", "health_monitor.zip": "health_monitor.py"}
+
+
+          def fail(message):
+              print("::error::" + message)
+              sys.exit(1)
+
+
+          found = sorted(p.name for p in build.glob("*.zip"))
+          if "alarm_logger.zip" not in found:
+              fail("modules/automation/build/alarm_logger.zip was not produced by the plan.")
+          for name in found:
+              if (build / name).stat().st_size == 0:
+                  fail(name + " is empty.")
+              if name in handlers:
+                  with zipfile.ZipFile(build / name) as archive:
+                      if handlers[name] not in archive.namelist():
+                          fail(name + " does not contain " + handlers[name] + ".")
+          print("Lambda packages OK: " + ", ".join(found))
+          PY
+          tar -C ../.. -cf lambda-builds.tar modules/automation/build
+          BUILD_SHA256="$(sha256sum lambda-builds.tar | cut -d' ' -f1)"
           PLAN_SHA256="$(sha256sum tfplan | cut -d' ' -f1)"
           COMMIT_SHA="$(git rev-parse HEAD)"
-          printf 'commit_sha=%s\nplan_sha256=%s\n' "$COMMIT_SHA" "$PLAN_SHA256" > plan-meta.txt
-          for FILE in tfplan plan-meta.txt; do
+          printf 'commit_sha=%s\nplan_sha256=%s\nbuild_sha256=%s\n' "$COMMIT_SHA" "$PLAN_SHA256" "$BUILD_SHA256" > plan-meta.txt
+          for FILE in tfplan plan-meta.txt lambda-builds.tar; do
             aws s3 cp "$FILE" "s3://${STATE_BUCKET}/${PLAN_PREFIX}/${FILE}" \
               --region "$STATE_REGION" --sse AES256 --only-show-errors
             SSE="$(aws s3api head-object --bucket "$STATE_BUCKET" --key "${PLAN_PREFIX}/${FILE}" \
@@ -332,7 +363,8 @@ jobs:
           echo "plan_prefix=${PLAN_PREFIX}" >> "$GITHUB_OUTPUT"
           echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
           echo "plan_sha256=${PLAN_SHA256}" >> "$GITHUB_OUTPUT"
-          rm -f tfplan plan-meta.txt
+          echo "build_sha256=${BUILD_SHA256}" >> "$GITHUB_OUTPUT"
+          rm -f tfplan plan-meta.txt lambda-builds.tar
 
       ## Makes a skipped apply visible instead of a silently green plan-only run. When the apply stage will not
       ## run (plan only, or not the deployment branch) nothing will ever read the stored plan, so it is removed
@@ -422,6 +454,7 @@ jobs:
           STATE_REGION: ${{ vars.TF_STATE_REGION }}
           PLAN_PREFIX: ${{ needs.plan.outputs.plan_prefix }}
           EXPECTED_PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          EXPECTED_BUILD_SHA256: ${{ needs.plan.outputs.build_sha256 }}
           EXPECTED_SHA: ${{ needs.plan.outputs.commit_sha }}
         run: |
           case "$PLAN_PREFIX" in
@@ -431,13 +464,27 @@ jobs:
           mkdir -p plan-download
           aws s3 cp "s3://${STATE_BUCKET}/${PLAN_PREFIX}/plan-meta.txt" plan-download/plan-meta.txt --region "$STATE_REGION" --only-show-errors
           aws s3 cp "s3://${STATE_BUCKET}/${PLAN_PREFIX}/tfplan" plan-download/tfplan --region "$STATE_REGION" --only-show-errors
+          aws s3 cp "s3://${STATE_BUCKET}/${PLAN_PREFIX}/lambda-builds.tar" plan-download/lambda-builds.tar --region "$STATE_REGION" --only-show-errors
           grep -qx "commit_sha=${EXPECTED_SHA}" plan-download/plan-meta.txt
           grep -qx "plan_sha256=${EXPECTED_PLAN_SHA256}" plan-download/plan-meta.txt
+          grep -qx "build_sha256=${EXPECTED_BUILD_SHA256}" plan-download/plan-meta.txt
           ACTUAL_PLAN_SHA256="$(sha256sum plan-download/tfplan | cut -d' ' -f1)"
           if [ "$ACTUAL_PLAN_SHA256" != "$EXPECTED_PLAN_SHA256" ]; then
             echo "Plan checksum does not match the reviewed plan." >&2
             exit 1
           fi
+          ACTUAL_BUILD_SHA256="$(sha256sum plan-download/lambda-builds.tar | cut -d' ' -f1)"
+          if [ "$ACTUAL_BUILD_SHA256" != "$EXPECTED_BUILD_SHA256" ]; then
+            echo "Lambda package checksum does not match the planned packages." >&2
+            exit 1
+          fi
+          ## Only the build directory and .zip files directly inside it may be extracted (no other paths).
+          if tar -tf plan-download/lambda-builds.tar | grep -qvE '^modules/automation/build/([A-Za-z0-9_.-]+\.zip)?$'; then
+            echo "Unexpected entries in the Lambda package archive." >&2
+            exit 1
+          fi
+          ## The saved plan refers to these files by path and hash; restore them where the plan expects them.
+          tar -xf plan-download/lambda-builds.tar -C .
           mv plan-download/tfplan "${WORKING_DIRECTORY}/tfplan"
 
       ## Fresh runner: initialise the same S3 backend again. This does not create a plan.

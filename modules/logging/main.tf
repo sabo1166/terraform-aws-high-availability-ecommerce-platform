@@ -10,9 +10,16 @@ locals {
 
   ## Glue and Athena database names allow only letters, numbers, and underscores.
   glue_database_name = replace("${var.project_name}_${var.environment}_alb_logs", "-", "_")
+
+  ## Bucket names are global across all AWS accounts. Unless a name is supplied, derive a predictable one
+  ## that cannot collide with another account's bucket: the account ID and region make it unique.
+  custom_bucket_name   = var.alb_logs_bucket_name == null ? "" : trimspace(var.alb_logs_bucket_name)
+  alb_logs_bucket_name = local.custom_bucket_name != "" ? local.custom_bucket_name : "${var.project_name}-${var.environment}-alb-logs-${data.aws_caller_identity.current.account_id}-${data.aws_region.current.name}"
 }
 
 data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
 
 ## Regional Elastic Load Balancing account that delivers ALB access logs.
 ## Valid for regions that use a regional ELB account ID (for example us-east-1);
@@ -22,12 +29,19 @@ data "aws_elb_service_account" "main" {}
 ## Bucket for ALB access logs and Athena query results. Never force-destroyed,
 ## so logs cannot be lost through an accidental destroy that still has objects.
 resource "aws_s3_bucket" "alb_logs" {
-  bucket        = var.alb_logs_bucket_name
+  bucket        = local.alb_logs_bucket_name
   force_destroy = false
 
   tags = merge(local.common_tags, {
-    Name = var.alb_logs_bucket_name
+    Name = local.alb_logs_bucket_name
   })
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", local.alb_logs_bucket_name))
+      error_message = "The ALB log bucket name must be 3-63 lowercase letters, numbers, dots, or hyphens. If project_name or environment contain other characters, set alb_logs_bucket_name explicitly."
+    }
+  }
 }
 
 ## Disable ACLs; the bucket owner owns every object.

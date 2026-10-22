@@ -53,7 +53,8 @@ Route 53 -> CloudFront (+ ACM certificate, + WAF) -> Public ALB
 No default exists for these; supply your own (nothing is assumed):
 
 - `domain_name` and `route53_hosted_zone_id` (an existing Route 53 hosted zone that is authoritative for the domain)
-- `alb_logs_bucket_name` (globally unique S3 bucket name)
+
+Optional: `alb_logs_bucket_name` (S3 bucket names are global; when unset the ALB log bucket is named `<project>-<environment>-alb-logs-<account id>-<region>`, which is unique per account and region).
 
 Optional: `origin_verify_header_value` (secret, 16+ characters). When unset, Terraform generates a random value (`random_password.origin_verify`) and uses it for both CloudFront and the ALB; to pin your own, set `$env:TF_VAR_origin_verify_header_value`. Either way it is stored in Terraform state.
 

@@ -99,8 +99,9 @@ variable "origin_verify_header_value" {
 
 ## Logging.
 variable "alb_logs_bucket_name" {
-  description = "Globally unique name of the S3 bucket for ALB access logs."
+  description = "Optional globally unique name of the S3 bucket for ALB access logs. Leave null to use <project>-<environment>-alb-logs-<account id>-<region>, which is unique per account and region."
   type        = string
+  default     = null
 }
 
 ## Compute sizing (see modules/compute for defaults and validation).
