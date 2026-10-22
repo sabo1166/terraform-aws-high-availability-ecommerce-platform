@@ -94,6 +94,31 @@ resource "aws_s3_bucket_lifecycle_configuration" "state" {
     }
   }
 
+  ## Saved Terraform plans written by the deploy workflow (<state prefix>plans/) can contain sensitive
+  ## values. The workflow deletes them after a successful apply or a plan-only run; this rule is the
+  ## backstop for failed or cancelled runs and for the noncurrent version that versioning keeps after a
+  ## delete. State files are not under this prefix, so they are never touched.
+  rule {
+    id     = "expire-saved-plans"
+    status = "Enabled"
+
+    filter {
+      prefix = "${var.state_key_prefix}plans/"
+    }
+
+    expiration {
+      days = 7
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+
   depends_on = [aws_s3_bucket_versioning.state]
 }
 

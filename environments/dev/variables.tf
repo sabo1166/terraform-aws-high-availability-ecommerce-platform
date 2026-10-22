@@ -82,11 +82,19 @@ variable "route53_hosted_zone_id" {
   type        = string
 }
 
-## Origin protection secret. Supply it with TF_VAR_origin_verify_header_value, never in a committed file.
+## Origin protection secret. Optional: when null (the default) Terraform generates a random value, so no
+## secret has to be supplied or stored in CI. To pin your own value, set TF_VAR_origin_verify_header_value
+## in your environment, never in a committed file.
 variable "origin_verify_header_value" {
-  description = "Secret header value shared by CloudFront and the public ALB (at least 16 characters; stored in Terraform state)."
+  description = "Secret header value shared by CloudFront and the public ALB (at least 16 characters; stored in Terraform state). Leave null to generate a random value."
   type        = string
+  default     = null
   sensitive   = true
+
+  validation {
+    condition     = var.origin_verify_header_value == null || length(var.origin_verify_header_value) >= 16
+    error_message = "origin_verify_header_value must be at least 16 characters when set."
+  }
 }
 
 ## Logging.

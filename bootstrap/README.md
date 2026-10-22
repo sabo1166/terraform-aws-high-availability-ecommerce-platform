@@ -10,6 +10,7 @@ Creates the S3 bucket that stores Terraform state for the application stacks. It
 - Block Public Access (all four settings) and `BucketOwnerEnforced` ownership (ACLs disabled).
 - Versioning enabled; noncurrent versions expire after 90 days (configurable); incomplete uploads are aborted after 7 days; leftover delete markers (`expired_object_delete_marker`) are removed once no older versions remain.
 - Default encryption SSE-S3 (AES256), so no KMS key or KMS permissions are involved.
+- Lifecycle rule `expire-saved-plans`: objects under `<state_key_prefix>plans/` (saved Terraform plans stored by the deploy workflow) expire after 7 days and their noncurrent versions after 1 day. State files are not under that prefix. An existing bucket gets this rule only when this stack is applied again by an administrator.
 - Bucket policy with two Deny statements: any request not sent over TLS (`aws:SecureTransport = false`), and any request using a TLS version older than 1.2 (`s3:TlsVersion` `NumericLessThan` `1.2`).
 - State locking uses S3 native lock files (`use_lockfile = true`, Terraform 1.10 or later) from the consuming stack. **No DynamoDB table is created.**
 

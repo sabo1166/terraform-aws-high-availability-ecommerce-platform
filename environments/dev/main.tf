@@ -28,6 +28,22 @@ provider "aws" {
 locals {
   ## Every name served by CloudFront; also used for the certificate and DNS records.
   domain_names = concat([var.domain_name], var.subject_alternative_names)
+
+  ## The same secret goes to CloudFront (sent as a header) and to the ALB (the listener rule matches it),
+  ## so direct requests to the public ALB are not forwarded. A supplied value wins over the generated one.
+  origin_verify_header_value = coalesce(var.origin_verify_header_value, one(random_password.origin_verify[*].result))
+}
+
+## Generated origin verification secret, used only when var.origin_verify_header_value is null. Letters
+## and digits only, so it is a valid header value for both CloudFront and the ALB. It is stored in the
+## (encrypted, private) Terraform state like the other sensitive values. To rotate it, replace this
+## resource (terraform apply -replace='random_password.origin_verify[0]'); CloudFront and the ALB then
+## update together in the same apply.
+resource "random_password" "origin_verify" {
+  count = var.origin_verify_header_value == null ? 1 : 0
+
+  length  = 48
+  special = false
 }
 
 ## Create the network foundation before deploying application services.
@@ -85,7 +101,7 @@ module "alb" {
   internal_alb_security_group_id = module.security.internal_alb_security_group_id
   access_logs_bucket_name        = module.logging.alb_logs_bucket_name
   enable_origin_verification     = true
-  origin_verify_header_value     = var.origin_verify_header_value
+  origin_verify_header_value     = local.origin_verify_header_value
   frontend_health_check_path     = var.frontend_health_check_path
   backend_health_check_path      = var.backend_health_check_path
 
@@ -193,7 +209,7 @@ module "cloudfront" {
   aliases                    = local.domain_names
   certificate_arn            = module.acm.certificate_arn
   web_acl_arn                = module.waf.web_acl_arn
-  origin_verify_header_value = var.origin_verify_header_value
+  origin_verify_header_value = local.origin_verify_header_value
 }
 
 ## Point the domain names at CloudFront.
