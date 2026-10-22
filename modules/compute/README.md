@@ -31,7 +31,7 @@ Both tiers are created with `for_each` over `frontend` and `backend` (addresses 
 | `frontend`, `backend` | Object: `instance_type`, `min_size`, `max_size`, `desired_capacity`, `root_volume_size` | `t3.micro`, 2, 4, 2, 20 |
 | `health_check_grace_period` | Seconds | `300` |
 | `instance_refresh_min_healthy_percentage` | Percent | `50` |
-| `wait_for_capacity_timeout` | Terraform wait after ASG creation | `10m` |
+| `wait_for_capacity_timeout` | Terraform wait after ASG creation (`0` disables); `environments/dev` sets `0` until an application exists | `10m` |
 
 Capacity must satisfy `2 <= min_size <= desired_capacity <= max_size` so each tier spans two Availability Zones.
 
@@ -43,7 +43,7 @@ Capacity must satisfy `2 <= min_size <= desired_capacity <= max_size` so each ti
 
 - **Health-check paths live only in the ALB module.** They are not configured here and none has been verified against an application.
 - **Bootstrap is a placeholder** (`templates/*.sh.tftpl`): it writes `/var/log/bootstrap.log` and records the tier, with TODOs for installing the web server and runtime, deploying artifacts, and shipping logs. Application bootstrap and runtime health verification are pending.
-- **Expected failure until the application exists.** With ELB health checks, instances that serve nothing on the health-check path are marked unhealthy and replaced, and a real apply would wait up to `wait_for_capacity_timeout` for healthy capacity.
+- **Expected failure until the application exists.** With ELB health checks, instances that serve nothing on the health-check path are marked unhealthy and replaced, and an apply with the module default would wait up to `wait_for_capacity_timeout` for healthy capacity. `environments/dev` overrides this with `0` so apply does not block before an application exists; ELB health checks stay enabled, so unhealthy targets remain visible in the alarms and the health monitor. Set it back to a duration (for example `10m`) once the application serves the health-check path, so a failing rollout fails the apply.
 - The unpinned AMI lookup means a new Amazon Linux 2023 release triggers a rolling replacement; set `ami_id` to pin.
 - One instance profile (and IAM role) is shared by both tiers; it currently grants only `CloudWatchAgentServerPolicy`. There is no SSH and no Systems Manager access, so diagnosis relies on logs.
 - The root volume uses the account default EBS key, not a customer-managed KMS key.

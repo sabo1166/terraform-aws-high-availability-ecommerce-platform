@@ -164,3 +164,13 @@ variable "health_monitor_schedule_expression" {
   type        = string
   default     = "rate(5 minutes)"
 }
+
+## Pre-application setting: no application exists yet, so instances cannot pass ELB health checks.
+## "0" stops `apply` from blocking on healthy capacity; ELB health checks stay enabled and unhealthy
+## targets still show in the alarms and health monitor. Set to e.g. "10m" once an application serves
+## the health-check path so a genuinely failing rollout fails the apply.
+variable "asg_wait_for_capacity_timeout" {
+  description = "How long apply waits for healthy Auto Scaling Group capacity (0 disables waiting)."
+  type        = string
+  default     = "0"
+}

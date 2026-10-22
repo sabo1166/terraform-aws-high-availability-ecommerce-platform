@@ -65,7 +65,7 @@ These are static checks. `validate` does not prove resources can be created, and
 | --- | --- | --- | --- |
 | 1 | High | CloudFront reaches the ALB over plain HTTP, so the origin secret header and traffic cross the internet unencrypted. The public ALB group is open to `0.0.0.0/0` on 80 and 443. | `modules/cloudfront/main.tf:41`; `modules/security/main.tf:16-30` (code) |
 | 2 | High | Dev has no state backend; `backend.tf.example` is only an example and the bootstrap stack is unapplied. State would be local and unlocked, and holds the origin secret. | `environments/dev` (code) |
-| 3 | Medium | Dev `required_version = ">= 1.6.0"` but `use_lockfile` needs 1.10 or later. | `environments/dev/versions.tf` (code) |
+| 3 | ~~Medium~~ Resolved | Dev `required_version` was `>= 1.6.0` while `use_lockfile` needs 1.10 or later; it is now `>= 1.10.0` (see section 11). | `environments/dev/versions.tf` (code) |
 | 4 | Medium | No application, CI workflow, or Glue table exists; several placeholder directories are empty. | Section 4 |
 | 5 | Medium | All private security groups allow egress to `0.0.0.0/0`, including the database group. | `modules/security/main.tf:68, 99, 130, 161` |
 | 6 | Medium | The shared EC2 role serves both tiers and has no access to the database secret, so the backend cannot fetch credentials; per-tier roles are needed first. | `modules/iam/main.tf:40`; `modules/database/README.md` |
@@ -76,7 +76,7 @@ These are static checks. `validate` does not prove resources can be created, and
 
 ### Possible risks (not verified on AWS)
 
-- The first `terraform apply` may wait up to `wait_for_capacity_timeout` (default 10m, `modules/compute/variables.tf:137`) and instances may fail ELB health checks in a replacement loop, because the bootstrap installs no application.
+- Instances may fail ELB health checks and be replaced in a loop, because the bootstrap installs no application. The apply-time wait is now `0` in dev (the module default stays `10m`), so apply will not block or fail on this; the unhealthy targets only show in the alarms and health monitor logs (section 11).
 - Unhealthy-host alarms will fire until an application serves the health-check path.
 - The customer-managed key on the alarm SNS topic is intended to work with CloudWatch alarms and the Lambda subscription; not tested.
 - The health monitor log policy uses `"${log_group.arn}:*"`; I expect the provider ARN to have no suffix, but this was not checked locally.
@@ -94,12 +94,26 @@ Application code and deployment artifacts; health endpoints; a real domain and h
 
 ## 9. Remediation plan
 
-- **P0:** apply the bootstrap stack and configure the dev backend with human approval; raise dev `required_version` to 1.10 or later; set the compute capacity wait to `0` until an application exists.
+- **P0:** ~~raise dev `required_version` to 1.10 or later~~ (done); ~~set the compute capacity wait to `0` in dev until an application exists~~ (done); **still open:** apply the bootstrap stack and configure the dev backend with human approval, following the sequence in `bootstrap/README.md`.
 - **P1:** regional certificate, HTTPS listener, origin DNS name, `https-only`, and restrict the public ALB group to the CloudFront prefix list; per-tier IAM roles and database secret access; tighten security-group egress and add VPC endpoints and scaling policies; add a CI workflow for `fmt`, `validate`, and the tests.
 - **P2:** Glue table, flow/CloudFront/WAF logging, Lambda error alarms, pin `ami_id`, align test layout.
 - Then review a real `terraform plan` and run a human-approved apply in a throwaway environment.
 
 ## 10. Verdict
 
-- **Commit:** ready once the staged set and this documentation are reviewed.
+- **Commit:** the initial state is committed (`c2ce9ae`); the P0 hardening below is uncommitted.
 - **Deploy:** **not ready.** Nothing has been verified on AWS and no application exists.
+
+## 11. Local P0 hardening (after commit c2ce9ae)
+
+Changes (code, uncommitted):
+
+- `environments/dev/versions.tf`: `required_version` raised to `>= 1.10.0` (the local Terraform is v1.16.2; the `aws ~> 5.100` and `archive ~> 2.7` constraints and the lock file are unchanged).
+- `environments/dev/variables.tf` and `main.tf`: new `asg_wait_for_capacity_timeout` (default `"0"`) passed to the compute module. The compute module default stays `10m`. ELB health checks and the grace period are unchanged; only Terraform's apply-time wait is disabled, so unhealthy targets are still reported by the alarms and the health monitor but no longer block `apply`. Set it back to a duration once an application serves the health-check path.
+- `bootstrap/README.md`: exact remote-state sequence, prerequisites (Terraform 1.10, bucket and object permissions, no DynamoDB), and migration notes. No `terraform.tfstate` exists in `environments/dev/`, so there is nothing to migrate if the backend is configured before the first apply.
+- `modules/compute/README.md`: documents the wait behavior.
+- `docs/architecture/https-origin-design.md`: proposal only for HTTPS between CloudFront and the ALB (origin hostname, regional ACM certificate, ALB 443 listener, `https-only` origin, CloudFront prefix-list restriction). Not implemented: it needs a confirmed domain, hosted zone, and certificate strategy.
+
+Local results (no AWS access): `terraform fmt -check -recursive` exit 0; Python tests 10 and 8, all OK (mocked); `init -backend=false` and `validate` for `environments/dev` and `bootstrap` in isolated copies both valid; the regenerated dev lock file is identical to the repository copy.
+
+Still open: bootstrap apply and backend configuration (needs approval and credentials), HTTPS to the origin, per-tier IAM roles, scaling policies, security-group egress, CI, application code. None of this has been verified on AWS.

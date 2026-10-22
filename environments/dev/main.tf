@@ -104,6 +104,7 @@ module "compute" {
   backend_target_group_arn   = module.alb.backend_target_group_arn
   frontend                   = var.frontend
   backend                    = var.backend
+  wait_for_capacity_timeout  = var.asg_wait_for_capacity_timeout
 }
 
 ## Create the RDS MySQL database in the private database subnets.
