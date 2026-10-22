@@ -45,7 +45,7 @@ defaults:
 jobs:
   frontend-ci:
     name: "Frontend CI (test, build)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
       run:
@@ -53,12 +53,12 @@ jobs:
         working-directory: application/frontend
     steps:
       - name: "1. Check out the repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: "2. Set up Node.js (version from application/frontend/.nvmrc)"
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: application/frontend/.nvmrc
           cache: npm
@@ -86,7 +86,7 @@ jobs:
           echo "Build output: $(find dist -type f | wc -l) files, $(du -sh dist | cut -f1)"
 
       - name: "8. Upload the frontend build artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist-${{ github.sha }}-${{ github.run_attempt }}
           path: application/frontend/dist
@@ -95,7 +95,7 @@ jobs:
 
   backend-ci:
     name: "Backend CI (MySQL 8, type check, test, build)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
@@ -124,12 +124,12 @@ jobs:
       MYSQL_TEST_DATABASE: oriel_test
     steps:
       - name: "1. Check out the repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: "2. Set up Node.js (version from application/backend/.nvmrc)"
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: application/backend/.nvmrc
           cache: npm
@@ -214,7 +214,7 @@ jobs:
           echo "Build output: $(find dist -type f | wc -l) files"
 
       - name: "12. Upload the backend build artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backend-dist-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -233,7 +233,7 @@ jobs:
     name: "Infrastructure check (optional, read-only)"
     needs: [frontend-ci, backend-ci]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_infrastructure }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -260,18 +260,18 @@ jobs:
           echo "All required secrets and variables are set (values not shown)."
 
       - name: "2. Check out the repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: "3. Set up Terraform"
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "^1.10.0"
           terraform_wrapper: false
 
       - name: "4. Configure AWS credentials (access keys, read-only use)"
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -333,7 +333,7 @@ jobs:
     name: CI Summary
     needs: [frontend-ci, backend-ci, infrastructure-check]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     steps:

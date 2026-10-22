@@ -45,7 +45,7 @@ GitHub repository (or Environment) **variables**: `AWS_REGION`, `TF_STATE_BUCKET
 
 ## Known limitations
 
-- Never executed: expect first-run fixes. Action versions use major tags (`@v4`, `@v3`), not commit SHAs; pin SHAs after verifying them.
+- Never executed: expect first-run fixes. Action versions use major tags (Node 24 majors: `checkout@v7`, `setup-node@v7`, `setup-python@v7`, `upload-artifact@v7`, `download-artifact@v8`, `setup-terraform@v4`, `configure-aws-credentials@v6`), not commit SHAs; pin SHAs after verifying them. Jobs run on the pinned `ubuntu-24.04` image instead of `ubuntu-latest`, so GitHub's gradual `-latest` migration cannot change the OS under a pipeline; move the pin deliberately (for example to `ubuntu-26.04`) after a validation run.
 - Lock files hold hashes from the machine that created them; `terraform init` on Linux runners may fail or want updates if a platform hash is missing. If that happens, run `terraform providers lock` for `linux_amd64` and commit the result. `-lockfile=readonly` is not used for this reason.
 - Reviewers see only addresses and actions, not attribute-level diffs, to avoid exposing sensitive values; a deeper review needs a separate, access-controlled process.
 - `terraform_version: "^1.10.0"` accepts any 1.x release from 1.10; pin an exact version for fully reproducible runs.

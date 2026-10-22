@@ -53,23 +53,23 @@ jobs:
   validate:
     name: Format, validate, and test
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       ## environments/dev requires Terraform >= 1.10.0 (S3 native locking in the backend example).
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "^1.10.0"
           terraform_wrapper: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           ## Matches the python3.12 Lambda runtime in modules/automation.
           python-version: "3.12"
@@ -98,7 +98,7 @@ jobs:
   plan:
     name: Init, validate, and plan
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -120,12 +120,12 @@ jobs:
           fi
 
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: 1a. INIT - set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "^1.10.0"
           terraform_wrapper: false
@@ -134,7 +134,7 @@ jobs:
       ## never echoed by this workflow. Give this IAM user only what a plan needs (state access plus
       ## read access to refresh); it must not be the apply identity.
       - name: 1b. INIT - configure AWS credentials (plan keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -214,7 +214,7 @@ jobs:
           rm -f tfplan
 
       - name: 3e. PLAN - upload the encrypted plan
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -244,7 +244,7 @@ jobs:
     ## Only on the deployment branch (repository variable TF_DEPLOY_BRANCH, default master), only when
     ## "apply" is selected, and only after the whole plan job (init, validate, plan) succeeded.
     if: ${{ inputs.apply && github.ref_name == (vars.TF_DEPLOY_BRANCH || 'master') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     ## The "dev-apply" Environment holds the apply identity's AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as
     ## ENVIRONMENT secrets. For automatic apply it must have NO required reviewers and NO wait timer (these
@@ -255,7 +255,7 @@ jobs:
     steps:
       ## Same commit that produced the plan, not the branch tip at approval time.
       - name: Check out the planned commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.plan.outputs.commit_sha }}
           persist-credentials: false
@@ -271,13 +271,13 @@ jobs:
           fi
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "^1.10.0"
           terraform_wrapper: false
 
       - name: Download encrypted plan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.plan.outputs.artifact_name }}
           path: plan-artifact
@@ -302,7 +302,7 @@ jobs:
       ## they override inside this job). If the Environment has no secrets of its own, GitHub silently
       ## falls back to the repository (plan) keys, which defeats the separation: confirm they are set.
       - name: 1b. INIT - configure AWS credentials (apply keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
