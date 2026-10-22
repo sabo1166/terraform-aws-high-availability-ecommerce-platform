@@ -38,3 +38,16 @@ variable "noncurrent_version_retention_days" {
     error_message = "Retention must be at least 1 day."
   }
 }
+
+## Key prefix the application stacks use inside the bucket. It only shapes the generated
+## least-privilege policy (output state_access_policy_json); it does not create any object.
+variable "state_key_prefix" {
+  description = "Key prefix under which the dev stack stores its state and lock file (must end with a slash)."
+  type        = string
+  default     = "ha-ecommerce/dev/"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]*/$", var.state_key_prefix))
+    error_message = "The prefix must not start with a slash and must end with a slash, for example ha-ecommerce/dev/."
+  }
+}

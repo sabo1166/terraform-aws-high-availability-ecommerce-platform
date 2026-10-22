@@ -121,3 +121,24 @@ resource "aws_s3_bucket_policy" "state" {
 
   depends_on = [aws_s3_bucket_public_access_block.state]
 }
+
+## Least-privilege policy for whoever runs Terraform against this backend (for example the IAM user whose
+## access keys are stored as GitHub secrets). This data source only renders JSON; it creates nothing and
+## attaches nothing. It follows the S3 backend requirements: list the bucket, and read, write, and delete
+## objects under the state prefix (the delete is needed because use_lockfile creates and removes a
+## "<key>.tflock" object next to the state). No KMS permissions are needed because encryption is SSE-S3.
+data "aws_iam_policy_document" "state_access" {
+  statement {
+    sid       = "ListStateBucket"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.state.arn]
+  }
+
+  statement {
+    sid       = "ReadWriteStateObjects"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.state.arn}/${var.state_key_prefix}*"]
+  }
+}

@@ -1,0 +1,4 @@
+## Copy to terraform.tfvars (gitignored) and set your own globally unique bucket name.
+## Do not put AWS access keys or any other secret in this file.
+# state_bucket_name = "<globally-unique-bucket-name>"
+# aws_region        = "us-east-1"
