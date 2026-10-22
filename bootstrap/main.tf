@@ -82,6 +82,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "state" {
       noncurrent_days = var.noncurrent_version_retention_days
     }
 
+    ## Versioning turns every delete (for example the .tflock file Terraform removes after each run)
+    ## into a delete marker. Once all older versions have expired, remove the leftover marker so
+    ## markers do not accumulate. This never touches current versions.
+    expiration {
+      expired_object_delete_marker = true
+    }
+
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
     }
@@ -113,6 +120,30 @@ data "aws_iam_policy_document" "state_tls_only" {
       values   = ["false"]
     }
   }
+
+  ## Also refuse TLS 1.0 and 1.1. Requests over TLS 1.2 or newer are unaffected. Clients that
+  ## cannot do TLS 1.2 (very old tooling) will be rejected.
+  statement {
+    sid     = "DenyOldTlsVersions"
+    effect  = "Deny"
+    actions = ["s3:*"]
+
+    resources = [
+      aws_s3_bucket.state.arn,
+      "${aws_s3_bucket.state.arn}/*",
+    ]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "NumericLessThan"
+      variable = "s3:TlsVersion"
+      values   = ["1.2"]
+    }
+  }
 }
 
 resource "aws_s3_bucket_policy" "state" {
@@ -140,5 +171,16 @@ data "aws_iam_policy_document" "state_access" {
     effect    = "Allow"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
     resources = ["${aws_s3_bucket.state.arn}/${var.state_key_prefix}*"]
+  }
+
+  ## An explicit Deny always overrides an Allow in IAM policy evaluation. This stops the identity the
+  ## policy is attached to from deleting a state object (a key ending in ".tfstate"). It does NOT match
+  ## the lock file "<key>.tflock" (it ends in ".tflock"), so locking keeps working: the Allow above still
+  ## lets Terraform create and delete that file. See bootstrap/README.md for what this does not cover.
+  statement {
+    sid       = "DenyDeletingStateObjects"
+    effect    = "Deny"
+    actions   = ["s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.state.arn}/${var.state_key_prefix}*.tfstate"]
   }
 }

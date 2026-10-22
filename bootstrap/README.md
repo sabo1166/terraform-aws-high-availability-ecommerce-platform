@@ -8,9 +8,9 @@ Creates the S3 bucket that stores Terraform state for the application stacks. It
 
 - S3 bucket named by the operator (globally unique, no default), `force_destroy = false`, `prevent_destroy = true`.
 - Block Public Access (all four settings) and `BucketOwnerEnforced` ownership (ACLs disabled).
-- Versioning enabled; noncurrent versions expire after 90 days (configurable); incomplete uploads are aborted after 7 days.
+- Versioning enabled; noncurrent versions expire after 90 days (configurable); incomplete uploads are aborted after 7 days; leftover delete markers (`expired_object_delete_marker`) are removed once no older versions remain.
 - Default encryption SSE-S3 (AES256), so no KMS key or KMS permissions are involved.
-- Bucket policy denying every request that is not sent over TLS (`aws:SecureTransport = false`).
+- Bucket policy with two Deny statements: any request not sent over TLS (`aws:SecureTransport = false`), and any request using a TLS version older than 1.2 (`s3:TlsVersion` `NumericLessThan` `1.2`).
 - State locking uses S3 native lock files (`use_lockfile = true`, Terraform 1.10 or later) from the consuming stack. **No DynamoDB table is created.**
 
 It also renders a least-privilege IAM policy as the output `state_access_policy_json`. That is JSON only: this stack creates and attaches no IAM resource and contains no credentials.
@@ -35,7 +35,7 @@ Never put access keys, passwords, or other secrets in Terraform files, variables
 
 - **Repository secrets:** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (created by you in GitHub; not created or changed by this repository, and never pasted into chat).
 - **Repository variables:** `AWS_REGION` (region for the AWS provider and credentials), `TF_STATE_BUCKET` (the bucket name), and `TF_STATE_REGION` (the bucket's region; the same value as `AWS_REGION` for this lab).
-- **Existing workflows do not match yet.** `.github/workflows/terraform.yml` and `application.yml` currently authenticate with `aws-actions/configure-aws-credentials` and `role-to-assume` (OIDC roles in `AWS_PLAN_ROLE_ARN`, `AWS_APPLY_ROLE_ARN`, `AWS_READONLY_ROLE_ARN`). Switching them to the two secrets above is a separate, later change; it was deliberately not made in this phase.
+- **Workflows:** `.github/workflows/terraform.yml` and `application.yml` read exactly these two secrets through `aws-actions/configure-aws-credentials` (no OIDC). The plan job uses the repository-level secrets; the apply job (Environment `dev-apply`) uses secrets of the same names stored on that Environment, which override the repository ones there. See `docs/runbooks/ci-cd.md`.
 - Long-lived access keys are riskier than OIDC roles. Use a dedicated IAM user for this lab, give it only the permissions below, rotate or delete the keys when the lab ends, and never share them with the bootstrap operator account.
 
 ### Minimum IAM permissions
@@ -50,7 +50,9 @@ Never put access keys, passwords, or other secrets in Terraform files, variables
       "Resource": "arn:aws:s3:::<bucket-name>" },
     { "Sid": "ReadWriteStateObjects", "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::<bucket-name>/ha-ecommerce/dev/*" }
+      "Resource": "arn:aws:s3:::<bucket-name>/ha-ecommerce/dev/*" },
+    { "Sid": "DenyDeletingStateObjects", "Effect": "Deny", "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::<bucket-name>/ha-ecommerce/dev/*.tfstate" }
   ]
 }
 ```
@@ -89,6 +91,21 @@ Everything that touches AWS needs explicit human approval. Nothing below has bee
 - Never use `-lock=false` or `force-unlock` without understanding who holds the lock. A leftover `.tflock` object means another run is active or crashed.
 - The bucket has `prevent_destroy` and `force_destroy = false`; removing it deliberately means emptying it (including all versions) and editing this configuration. Old state versions expire after 90 days, which limits rollback history.
 - The bootstrap stack's own local state cannot be moved into the bucket it creates without a second, separate migration; that is intentionally not set up.
+
+## Security hardening and its limits
+
+What the three hardening settings do, and what they do not:
+
+- **Delete-marker cleanup (lifecycle).** `use_lockfile` creates and deletes `terraform.tfstate.tflock` on every run; with versioning each delete leaves a delete marker. The lifecycle rule now also removes a marker once no older versions of that key remain (`expired_object_delete_marker`). It never removes the current version of an object, and the existing 90-day noncurrent-version expiry and 7-day multipart cleanup are unchanged. It does not change retention: old state versions are still permanently removed after the configured number of days.
+- **TLS 1.2 minimum (bucket policy).** A second Deny statement rejects requests that use TLS 1.0 or 1.1 (`s3:TlsVersion` below `1.2`), in addition to the existing HTTPS-only Deny. Clients that cannot negotiate TLS 1.2 will be refused. The condition applies to every principal, including administrators. I did not test this on AWS.
+- **No deleting state objects (generated IAM policy).** The policy from `state_access_policy_json` now contains an explicit `DenyDeletingStateObjects` statement for `s3:DeleteObject` on keys under the prefix that end in `.tfstate`. In IAM evaluation an explicit Deny overrides an Allow, so the identity this policy is attached to cannot delete `ha-ecommerce/dev/terraform.tfstate`, while the Allow still lets it create and delete `terraform.tfstate.tflock`, because that key does not end in `.tfstate`. The policy also still does not grant `s3:DeleteObjectVersion`, so that identity cannot permanently remove versions.
+
+**What this does not protect against:**
+
+- The Deny lives in the identity policy, not in the bucket policy. It only constrains identities this policy is attached to. Administrators, the account root user, other IAM users or roles with their own S3 permissions, and anyone who can edit or detach the policy are not constrained by it.
+- It does not stop the same identity from **overwriting** the state object (the Allow includes `s3:PutObject`), from running `terraform destroy` against the infrastructure, or from running `terraform state rm`; versioning is what allows recovery from a bad overwrite.
+- It blocks only `s3:DeleteObject`. A principal with other permissions (for example `s3:DeleteObjectVersion` or `s3:*`) can still remove versions or the bucket's contents, and noncurrent versions are deleted by the lifecycle rule after the retention period.
+- The bucket has no S3 Object Lock, no MFA Delete, no access logging, and no copy in another region or account. Nothing here has been applied or tested against AWS; the wildcard matching (`*.tfstate` matches the state key and not `*.tflock`) was checked only with a local pattern test.
 
 ## Notes
 
