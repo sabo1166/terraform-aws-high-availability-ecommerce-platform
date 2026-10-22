@@ -1,0 +1,199 @@
+name: Application
+
+## Tests and production builds for application/frontend and application/backend.
+## The backend job also runs the MySQL store tests against a throwaway MySQL service container.
+## Application deployment is NOT implemented: the Terraform resources define no way to deliver code to
+## the private instances (see docs/runbooks/application-deployment.md). The optional infrastructure
+## check below only reads Terraform outputs and Auto Scaling Group health; it deploys nothing.
+on:
+  pull_request:
+    paths:
+      - "application/**"
+      - ".github/workflows/application.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "application/**"
+      - ".github/workflows/application.yml"
+  workflow_dispatch:
+    inputs:
+      check_infrastructure:
+        description: "Also check that the deployed Auto Scaling Groups are in service and healthy (read-only AWS access)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: application-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: application/frontend
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: application/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: application/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Production build (type check + bundle)
+        run: npm run build
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: application/frontend/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  backend:
+    name: Backend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: application/backend
+    ## A throwaway database for the MySQL store contract tests; it exists only for this job.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: oriel_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      MYSQL_TEST_HOST: 127.0.0.1
+      MYSQL_TEST_PORT: "3306"
+      MYSQL_TEST_USER: root
+      MYSQL_TEST_PASSWORD: ""
+      MYSQL_TEST_DATABASE: oriel_test
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: application/backend/.nvmrc
+          cache: npm
+          cache-dependency-path: application/backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test (including MySQL store contract tests)
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-dist-${{ github.sha }}
+          path: |
+            application/backend/dist
+            application/backend/package.json
+            application/backend/package-lock.json
+          retention-days: 7
+          if-no-files-found: error
+
+  ## Read-only: confirms the infrastructure that would receive a deployment is up. Requires the
+  ## remote state and AWS access keys in the repository secrets AWS_ACCESS_KEY_ID and
+  ## AWS_SECRET_ACCESS_KEY (see docs/runbooks/ci-cd.md); none exist yet. This job has no GitHub
+  ## Environment, so it uses the same repository-level keys as the Terraform plan identity.
+  infrastructure-check:
+    name: Infrastructure health check
+    needs: [frontend, backend]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_infrastructure }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "^1.10.0"
+          terraform_wrapper: false
+
+      ## Only reads the state bucket and describes Auto Scaling Groups; the keys are never echoed.
+      - name: Configure AWS credentials (access keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize remote backend (read outputs only)
+        working-directory: environments/dev
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          if [ -z "$STATE_BUCKET" ] || [ -z "$STATE_REGION" ]; then
+            echo "::error::TF_STATE_BUCKET and TF_STATE_REGION are not set; the infrastructure has not been bootstrapped."
+            exit 1
+          fi
+          cp backend.tf.example backend.tf
+          terraform init -input=false \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${STATE_REGION}"
+
+      ## Uses the real Terraform outputs frontend_asg_name and backend_asg_name. The ASGs use ELB health
+      ## checks, so an instance reported Healthy here has passed its load balancer health check.
+      - name: Verify both Auto Scaling Groups are in service and healthy
+        working-directory: environments/dev
+        run: |
+          for output in frontend_asg_name backend_asg_name; do
+            ASG="$(terraform output -raw "$output")"
+            TOTAL="$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG" \
+              --query 'length(AutoScalingGroups[0].Instances)' --output text)"
+            HEALTHY="$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG" \
+              --query 'length(AutoScalingGroups[0].Instances[?LifecycleState==`InService` && HealthStatus==`Healthy`])' \
+              --output text)"
+            echo "${output}: ${HEALTHY}/${TOTAL} instance(s) in service and healthy"
+            if [ "$TOTAL" = "None" ] || [ "$TOTAL" -lt 1 ] || [ "$HEALTHY" != "$TOTAL" ]; then
+              echo "::error::${output} is not fully healthy."
+              exit 1
+            fi
+          done

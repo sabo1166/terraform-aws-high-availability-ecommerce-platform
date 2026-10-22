@@ -1,0 +1,294 @@
+name: Terraform
+
+## Validation runs on every pull request and push without AWS credentials. Infrastructure
+## deployment is manual (workflow_dispatch): a plan job, then an apply job that only runs when
+## "apply" is selected and a reviewer approves the protected "dev-apply" GitHub Environment.
+## Destroy is never run by this workflow. Required configuration: docs/runbooks/ci-cd.md.
+##
+## AWS authentication uses static access keys (no OIDC), always read from the secrets
+## AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. Access boundary between plan and apply:
+##   - plan job: no GitHub Environment, so it reads the REPOSITORY-level secrets (the plan identity).
+##   - apply job: runs in the "dev-apply" Environment; ENVIRONMENT-level secrets with the same names
+##     override the repository ones there, so the apply identity is only available to approved runs.
+## The validate job never uses AWS credentials.
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply the reviewed plan after Environment approval (otherwise plan only)"
+        type: boolean
+        default: false
+      allow_deletions:
+        description: "Allow a plan that deletes or replaces resources (otherwise the plan job fails)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+## Validation runs may be cancelled by newer commits; manual deployments never are.
+concurrency:
+  group: terraform-${{ github.event_name == 'workflow_dispatch' && 'deploy' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  PYTHONDONTWRITEBYTECODE: "1"
+  WORKING_DIRECTORY: environments/dev
+
+jobs:
+  validate:
+    name: Format, validate, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      ## environments/dev requires Terraform >= 1.10.0 (S3 native locking in the backend example).
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "^1.10.0"
+          terraform_wrapper: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          ## Matches the python3.12 Lambda runtime in modules/automation.
+          python-version: "3.12"
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Validate bootstrap (backend disabled)
+        working-directory: bootstrap
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Validate environments/dev (backend disabled)
+        working-directory: environments/dev
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Lambda unit tests (health monitor)
+        run: python -B -m unittest discover -s tests/lambda -v
+
+      - name: Lambda unit tests (alarm logger)
+        run: python -B -m unittest discover -s modules/automation/tests -v
+
+  plan:
+    name: Plan
+    needs: validate
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
+      plan_sha256: ${{ steps.meta.outputs.plan_sha256 }}
+    steps:
+      ## The remote state bucket comes from the bootstrap stack. Without it, stop here instead of
+      ## falling back to local state.
+      - name: Require a bootstrapped remote state
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          if [ -z "$STATE_BUCKET" ] || [ -z "$STATE_REGION" ]; then
+            echo "::error::TF_STATE_BUCKET and TF_STATE_REGION are not set. Apply the bootstrap stack first (bootstrap/README.md)."
+            exit 1
+          fi
+
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "^1.10.0"
+          terraform_wrapper: false
+
+      ## Plan identity: repository-level secrets. GitHub masks secret values in logs and the keys are
+      ## never echoed by this workflow. Give this IAM user only what a plan needs (state access plus
+      ## read access to refresh); it must not be the apply identity.
+      - name: Configure AWS credentials (plan keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      ## backend.tf is created at run time from the committed example; the bucket name is not committed.
+      - name: Initialize remote backend
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          cp backend.tf.example backend.tf
+          terraform init -input=false \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${STATE_REGION}"
+
+      ## A normal plan only: this workflow never uses -destroy.
+      - name: Terraform plan
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+          TF_VAR_route53_hosted_zone_id: ${{ vars.ROUTE53_HOSTED_ZONE_ID }}
+          TF_VAR_alb_logs_bucket_name: ${{ vars.ALB_LOGS_BUCKET_NAME }}
+          TF_VAR_origin_verify_header_value: ${{ secrets.ORIGIN_VERIFY_HEADER_VALUE }}
+        run: terraform plan -input=false -lock-timeout=5m -out=tfplan > /dev/null
+
+      ## Only resource addresses and actions are printed. Plan values (which can include the
+      ## origin secret and other sensitive data) are never written to the log.
+      - name: Summarize plan (addresses and actions only)
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          {
+            echo "### Terraform plan (commit ${GITHUB_SHA})"
+            echo
+            echo '```'
+            terraform show -json tfplan | jq -r '
+              .resource_changes[]
+              | select(.change.actions != ["no-op"])
+              | "\(.change.actions | join(",")) \(.address)"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      ## Deleting or replacing resources (including the database) needs an explicit opt-in.
+      - name: Block deletions unless allowed
+        if: ${{ !inputs.allow_deletions }}
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          DELETIONS="$(terraform show -json tfplan | jq '[.resource_changes[] | select(.change.actions | index("delete"))] | length')"
+          if [ "$DELETIONS" -gt 0 ]; then
+            echo "::error::The plan deletes or replaces ${DELETIONS} resource(s). Review the job summary and re-run with allow_deletions if intended."
+            exit 1
+          fi
+
+      ## The saved plan can contain secrets, so it is encrypted before it becomes an artifact.
+      - name: Encrypt plan and record metadata
+        id: meta
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          PLAN_KEY: ${{ secrets.TFPLAN_ENCRYPTION_KEY }}
+        run: |
+          PLAN_SHA256="$(sha256sum tfplan | cut -d' ' -f1)"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in tfplan -out tfplan.enc -pass env:PLAN_KEY
+          printf 'commit_sha=%s\nplan_sha256=%s\n' "$COMMIT_SHA" "$PLAN_SHA256" > plan-meta.txt
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "plan_sha256=${PLAN_SHA256}" >> "$GITHUB_OUTPUT"
+          rm -f tfplan
+
+      - name: Upload encrypted plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.WORKING_DIRECTORY }}/tfplan.enc
+            ${{ env.WORKING_DIRECTORY }}/plan-meta.txt
+          retention-days: 3
+          if-no-files-found: error
+
+  apply:
+    name: Apply reviewed plan
+    needs: plan
+    if: ${{ inputs.apply }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    ## Configure required reviewers (and a branch restriction) on this Environment in GitHub, and store
+    ## the apply identity's AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as ENVIRONMENT secrets here.
+    environment: dev-apply
+    permissions:
+      contents: read
+    steps:
+      ## Same commit that produced the plan, not the branch tip at approval time.
+      - name: Check out the planned commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out commit
+        env:
+          EXPECTED_SHA: ${{ needs.plan.outputs.commit_sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "Checked-out commit does not match the planned commit." >&2
+            exit 1
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "^1.10.0"
+          terraform_wrapper: false
+
+      - name: Download encrypted plan
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.artifact_name }}
+          path: plan-artifact
+
+      - name: Decrypt and verify the reviewed plan
+        env:
+          PLAN_KEY: ${{ secrets.TFPLAN_ENCRYPTION_KEY }}
+          EXPECTED_PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.commit_sha }}
+        run: |
+          grep -qx "commit_sha=${EXPECTED_SHA}" plan-artifact/plan-meta.txt
+          grep -qx "plan_sha256=${EXPECTED_PLAN_SHA256}" plan-artifact/plan-meta.txt
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in plan-artifact/tfplan.enc -out "${WORKING_DIRECTORY}/tfplan" -pass env:PLAN_KEY
+          ACTUAL_PLAN_SHA256="$(sha256sum "${WORKING_DIRECTORY}/tfplan" | cut -d' ' -f1)"
+          if [ "$ACTUAL_PLAN_SHA256" != "$EXPECTED_PLAN_SHA256" ]; then
+            echo "Plan checksum does not match the reviewed plan." >&2
+            exit 1
+          fi
+
+      ## Apply identity: the dev-apply ENVIRONMENT secrets (same names as the repository secrets, which
+      ## they override inside this job). If the Environment has no secrets of its own, GitHub silently
+      ## falls back to the repository (plan) keys, which defeats the separation: confirm they are set.
+      - name: Configure AWS credentials (apply keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize remote backend
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          cp backend.tf.example backend.tf
+          terraform init -input=false \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${STATE_REGION}"
+
+      ## Applying the saved plan applies exactly what was reviewed; Terraform rejects it if the
+      ## state changed since the plan was made. No variables are needed with a saved plan.
+      - name: Terraform apply (saved plan)
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: terraform apply -input=false -lock-timeout=5m tfplan
+
+      - name: Remove plan files
+        if: always()
+        run: rm -rf plan-artifact "${WORKING_DIRECTORY}/tfplan"
