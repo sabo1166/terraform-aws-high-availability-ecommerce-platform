@@ -1,11 +1,18 @@
 name: Terraform
 
-## Pull requests and pushes run an offline validation job (no AWS credentials, no backend).
-## Infrastructure deployment is manual (workflow_dispatch) and runs these stages in this order:
-##   1. INIT      set up Terraform, configure AWS credentials, initialise the S3 backend   (plan job)
-##   2. VALIDATE  terraform fmt -check -recursive, then terraform validate (after a successful init)
-##   3. PLAN      terraform plan -out, deletion/replacement guard, encrypted plan artifact
-##   4. APPLY     apply exactly that saved plan                                            (apply job)
+## Pull requests and pushes run one offline job, "offline-validate" (no AWS credentials, no backend).
+## Infrastructure deployment is manual (workflow_dispatch) and is four separate jobs, in this order:
+##   init      1. INIT      set up Terraform, check required settings, configure AWS credentials,
+##                          initialise the S3 backend (fails immediately if the backend is not usable)
+##   validate  2. VALIDATE  terraform fmt -check -recursive, then terraform validate   (needs: init)
+##   plan      3. PLAN      terraform plan -out, deletion/replacement guard, encrypted plan artifact
+##                                                                                    (needs: validate)
+##   apply     4. APPLY     apply exactly that saved plan                              (needs: plan)
+## Every job runs on a fresh runner: nothing under .terraform persists between jobs, so each job that
+## talks to Terraform state (init, plan, apply) sets up Terraform and initialises the same S3 backend
+## itself. The validate job needs no state, so it runs "init -backend=false" and has no AWS credentials.
+## The init, validate and plan jobs check out the same commit (github.sha, fixed when the run was
+## dispatched); the apply job checks out the commit recorded by the plan job.
 ## "apply" defaults to true, so a dispatch plans and then applies automatically. That is only
 ## "automatic" if the GitHub Environment "dev-apply" has NO required reviewers and NO wait timer;
 ## otherwise the apply job pauses for approval (see docs/runbooks/ci-cd.md). The apply job runs only
@@ -13,11 +20,13 @@ name: Terraform
 ## or replace resources fail unless "allow_deletions" is selected. Destroy is never run.
 ##
 ## AWS authentication uses static access keys (no OIDC), always read from the secrets
-## AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. Access boundary between plan and apply:
-##   - plan job: no GitHub Environment, so it reads the REPOSITORY-level secrets (the plan identity).
+## AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. Intended boundary between plan and apply:
+##   - init and plan jobs: no GitHub Environment, so they read the REPOSITORY-level secrets (the plan identity).
 ##   - apply job: runs in the "dev-apply" Environment; ENVIRONMENT-level secrets with the same names
 ##     override the repository ones there, so the apply identity is only used by the apply job.
-## The offline validate job never uses AWS credentials.
+## This workflow does NOT verify that the Environment really holds its own keys: if it does not, GitHub
+## silently uses the repository keys in the apply job. Check this in the GitHub settings.
+## The offline job and the validate job never use AWS credentials.
 on:
   pull_request:
   push:
@@ -48,10 +57,10 @@ env:
   WORKING_DIRECTORY: environments/dev
 
 jobs:
-  ## Offline gate for pull requests and pushes. Deployment runs (workflow_dispatch) validate inside the
-  ## plan job instead, after the backend has been initialised.
-  validate:
-    name: Format, validate, and test
+  ## Offline gate for pull requests and pushes. It never runs for deployment (workflow_dispatch) runs,
+  ## which validate in the validate job below instead.
+  offline-validate:
+    name: Format, validate, and test (offline)
     if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -95,20 +104,19 @@ jobs:
       - name: Lambda unit tests (alarm logger)
         run: python -B -m unittest discover -s modules/automation/tests -v
 
-  plan:
-    name: Init, validate, and plan
+  ## 1. INIT. Fails the run immediately if a required setting is missing or the S3 backend cannot be
+  ## initialised, so validate, plan and apply never start.
+  init:
+    name: Init
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
       contents: read
-    outputs:
-      artifact_name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
-      commit_sha: ${{ steps.meta.outputs.commit_sha }}
-      plan_sha256: ${{ steps.meta.outputs.plan_sha256 }}
     steps:
       ## The remote state bucket comes from the bootstrap stack. Without it, stop here instead of
       ## falling back to local state. Only the NAMES of missing settings are reported, never values.
+      ## These are repository-level values: the init and plan jobs have no Environment.
       - name: 1-pre. INIT - require the backend variables and credentials
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
@@ -117,6 +125,10 @@ jobs:
           HAS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
           HAS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
           HAS_PLAN_KEY: ${{ secrets.TFPLAN_ENCRYPTION_KEY != '' }}
+          DOMAIN_NAME_VAR: ${{ vars.DOMAIN_NAME }}
+          HOSTED_ZONE_ID_VAR: ${{ vars.ROUTE53_HOSTED_ZONE_ID }}
+          ALB_LOGS_BUCKET_VAR: ${{ vars.ALB_LOGS_BUCKET_NAME }}
+          HAS_ORIGIN_SECRET: ${{ secrets.ORIGIN_VERIFY_HEADER_VALUE != '' }}
         run: |
           MISSING=""
           [ -n "$STATE_BUCKET" ] || MISSING="$MISSING TF_STATE_BUCKET"
@@ -125,6 +137,10 @@ jobs:
           [ "$HAS_ACCESS_KEY_ID" = "true" ] || MISSING="$MISSING AWS_ACCESS_KEY_ID"
           [ "$HAS_SECRET_ACCESS_KEY" = "true" ] || MISSING="$MISSING AWS_SECRET_ACCESS_KEY"
           [ "$HAS_PLAN_KEY" = "true" ] || MISSING="$MISSING TFPLAN_ENCRYPTION_KEY"
+          [ -n "$DOMAIN_NAME_VAR" ] || MISSING="$MISSING DOMAIN_NAME"
+          [ -n "$HOSTED_ZONE_ID_VAR" ] || MISSING="$MISSING ROUTE53_HOSTED_ZONE_ID"
+          [ -n "$ALB_LOGS_BUCKET_VAR" ] || MISSING="$MISSING ALB_LOGS_BUCKET_NAME"
+          [ "$HAS_ORIGIN_SECRET" = "true" ] || MISSING="$MISSING ORIGIN_VERIFY_HEADER_VALUE"
           if [ -n "$MISSING" ]; then
             echo "::error::Missing required settings:${MISSING}. Apply the bootstrap stack first and configure the variables and secrets (bootstrap/README.md, docs/runbooks/ci-cd.md)."
             exit 1
@@ -133,6 +149,7 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: 1a. INIT - set up Terraform
@@ -152,6 +169,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       ## backend.tf is created at run time from the committed example; the bucket name is not committed.
+      ## The .terraform directory created here is discarded with this runner; later jobs re-initialise.
       - name: 1c. INIT - initialise the S3 backend
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
@@ -163,19 +181,91 @@ jobs:
             -backend-config="bucket=${STATE_BUCKET}" \
             -backend-config="region=${STATE_REGION}"
 
-      ## VALIDATE only runs if every INIT step succeeded (a failed step skips all later steps).
-      ## Neither command creates or changes any AWS resource.
+  ## 2. VALIDATE. Runs only if the init job succeeded. Neither command creates or changes any AWS
+  ## resource, reads state, or needs credentials, so the backend is disabled here.
+  validate:
+    name: Validate
+    needs: init
+    if: ${{ success() && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: 2-pre. VALIDATE - set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "^1.10.0"
+          terraform_wrapper: false
+
       - name: 2a. VALIDATE - terraform fmt -check -recursive
         run: terraform fmt -check -recursive
 
       - name: 2b. VALIDATE - terraform validate
         working-directory: ${{ env.WORKING_DIRECTORY }}
-        run: terraform validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  ## 3. PLAN. Runs only if validate (and therefore init) succeeded. Fresh runner: set up Terraform and
+  ## initialise the same S3 backend again.
+  plan:
+    name: Plan
+    needs: validate
+    if: ${{ success() && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: tfplan-${{ github.run_id }}-${{ github.run_attempt }}
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
+      plan_sha256: ${{ steps.meta.outputs.plan_sha256 }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: 3-pre. PLAN - set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "^1.10.0"
+          terraform_wrapper: false
+
+      ## Plan identity: repository-level secrets (same as the init job).
+      - name: 3-pre. PLAN - configure AWS credentials (plan keys)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: 3-pre. PLAN - initialise the S3 backend
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          cp backend.tf.example backend.tf
+          terraform init -input=false \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${STATE_REGION}"
 
       ## A normal plan only: this workflow never uses -destroy.
       - name: 3a. PLAN - terraform plan
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
+          ## One region for everything: the provider region (aws_region) comes from the same AWS_REGION
+          ## variable as the credentials step. The init job guarantees it is set.
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_route53_hosted_zone_id: ${{ vars.ROUTE53_HOSTED_ZONE_ID }}
           TF_VAR_alb_logs_bucket_name: ${{ vars.ALB_LOGS_BUCKET_NAME }}
@@ -249,17 +339,19 @@ jobs:
             echo "::notice::the apply stage will run next (it waits for approval only if the dev-apply Environment requires reviewers)."
           fi
 
+  ## 4. APPLY. Runs only if init, validate and plan all succeeded (plan needs validate, which needs
+  ## init), "apply" is selected and the run is on the deployment branch. It never creates a plan.
   apply:
     name: Apply saved plan
     needs: plan
     ## Only on the deployment branch (repository variable TF_DEPLOY_BRANCH, default master), only when
-    ## "apply" is selected, and only after the whole plan job (init, validate, plan) succeeded: if any of
-    ## those stages fails, is cancelled or is skipped, this job is skipped. It never creates a new plan.
+    ## "apply" is selected, and only after the plan job succeeded: if init, validate or plan fails, is
+    ## cancelled or is skipped, this job is skipped.
     if: ${{ success() && needs.plan.result == 'success' && inputs.apply && github.ref_name == (vars.TF_DEPLOY_BRANCH || 'master') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    ## The "dev-apply" Environment holds the apply identity's AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as
-    ## ENVIRONMENT secrets. For automatic apply it must have NO required reviewers and NO wait timer (these
+    ## The "dev-apply" Environment is meant to hold the apply identity's AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    ## as ENVIRONMENT secrets. For automatic apply it must have NO required reviewers and NO wait timer (these
     ## are GitHub settings, not workflow code); restrict its deployment branches to the deployment branch.
     environment: dev-apply
     permissions:
@@ -312,15 +404,17 @@ jobs:
 
       ## Apply identity: the dev-apply ENVIRONMENT secrets (same names as the repository secrets, which
       ## they override inside this job). If the Environment has no secrets of its own, GitHub silently
-      ## falls back to the repository (plan) keys, which defeats the separation: confirm they are set.
-      - name: 1b. INIT - configure AWS credentials (apply keys)
+      ## falls back to the repository (plan) keys, which defeats the separation, and this workflow
+      ## cannot detect that: confirm in the GitHub settings that they are set.
+      - name: 4-pre. APPLY - configure AWS credentials (apply keys)
         uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: 1c. INIT - initialise the S3 backend
+      ## Fresh runner: initialise the same S3 backend again. This does not create a plan.
+      - name: 4-pre. APPLY - initialise the S3 backend
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}

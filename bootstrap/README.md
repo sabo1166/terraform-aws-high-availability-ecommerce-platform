@@ -35,7 +35,7 @@ Never put access keys, passwords, or other secrets in Terraform files, variables
 
 - **Repository secrets:** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (created by you in GitHub; not created or changed by this repository, and never pasted into chat).
 - **Repository variables:** `AWS_REGION` (region for the AWS provider and credentials), `TF_STATE_BUCKET` (the bucket name), and `TF_STATE_REGION` (the bucket's region; the same value as `AWS_REGION` for this lab).
-- **Workflows:** `.github/workflows/terraform.yml` and `application.yml` read exactly these two secrets through `aws-actions/configure-aws-credentials` (no OIDC). The plan job uses the repository-level secrets; the apply job (Environment `dev-apply`) uses secrets of the same names stored on that Environment, which override the repository ones there. See `docs/runbooks/ci-cd.md`.
+- **Workflows:** `.github/workflows/terraform.yml` and `application.yml` read exactly these two secrets through `aws-actions/configure-aws-credentials` (no OIDC). The init and plan jobs use the repository-level secrets; the apply job (Environment `dev-apply`) uses secrets of the same names stored on that Environment, which override the repository ones there. See `docs/runbooks/ci-cd.md`.
 - Long-lived access keys are riskier than OIDC roles. Use a dedicated IAM user for this lab, give it only the permissions below, rotate or delete the keys when the lab ends, and never share them with the bootstrap operator account.
 
 ### Minimum IAM permissions
