@@ -1,0 +1,58 @@
+# Nginx site configuration for the FRONTEND instances (TEMPLATE, not applied by any automation).
+#
+# Traffic path: CloudFront -> public ALB -> this Nginx (port 80, the port the frontend security group
+# allows from the public ALB) -> /api/ proxied to the INTERNAL ALB (port 80) -> backend (port 3000).
+#
+# Render with:  INTERNAL_ALB_DNS=<internal ALB DNS name> envsubst '${INTERNAL_ALB_DNS}' < nginx.conf.template > /etc/nginx/conf.d/oriel.conf
+# The internal ALB DNS name is the Terraform output `internal_alb_dns_name` (environments/dev).
+# Static files come from the production build (application/frontend/dist) copied to /var/www/oriel.
+#
+# Not tested on a real instance. See docs/runbooks/application-deployment.md.
+
+server {
+    listen 80 default_server;
+    server_name _;
+
+    root /var/www/oriel;
+    index index.html;
+
+    # Load balancer health check: answers without touching the backend or the API.
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # API requests go to the internal ALB. Cookies and the original host/proto are forwarded so the
+    # backend can apply rate limits per client. Hops between a browser and the backend are CloudFront, the public ALB, this Nginx, and the internal ALB, so the backend should run with TRUST_PROXY=4 (not verified on AWS).
+    location /api/ {
+        proxy_pass http://${INTERNAL_ALB_DNS};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_set_header X-Request-Id $request_id;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+    }
+
+    # Fingerprinted build assets can be cached for a year.
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        try_files $uri =404;
+    }
+
+    # Single-page app: unknown paths serve index.html so client-side routes work on refresh.
+    location / {
+        add_header Cache-Control "no-cache";
+        try_files $uri /index.html;
+    }
+
+    # Security headers. The CSP is Report-Only until it has been checked in a real browser, because a
+    # wrong policy would silently break the 3D hero or inline styles.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+}
+

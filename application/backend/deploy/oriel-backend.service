@@ -1,0 +1,37 @@
+# systemd unit for the BACKEND instances (TEMPLATE, not applied by any automation).
+#
+# Assumes the compiled application is at /opt/oriel/backend (dist/, node_modules/ from `npm ci --omit=dev`,
+# package.json) and Node.js 22 is installed. The environment file must be created at boot by the
+# deployment mechanism, owned by root with mode 0600. It must contain NODE_ENV=production, STORE=mysql,
+# HOST/PORT=3000, JWT_SECRET, CORS_ORIGINS, TRUST_PROXY=4 (CloudFront, public ALB, Nginx, internal ALB), COOKIE_SECURE=true and the DB_* settings,
+# including DB_PASSWORD read from the RDS-managed Secrets Manager secret (Terraform output
+# db_master_user_secret_arn). Never store those values in the repository or the AMI.
+#
+# Not tested on a real instance. See docs/runbooks/application-deployment.md.
+
+[Unit]
+Description=Oriel demo store API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=oriel
+Group=oriel
+WorkingDirectory=/opt/oriel/backend
+EnvironmentFile=/etc/oriel/backend.env
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/oriel/backend
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+
