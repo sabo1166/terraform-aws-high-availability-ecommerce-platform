@@ -141,4 +141,3 @@ describe("Access control in the UI", () => {
     expect(await screen.findByRole("heading", { name: "No access" })).toBeInTheDocument();
   });
 });
-

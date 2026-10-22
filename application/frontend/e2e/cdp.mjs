@@ -152,5 +152,3 @@ export async function launch({ port = 9333 } = {}) {
 
   return { send, evaluate, waitFor, goto, viewport, screenshot, click, type, key, sleep, close, consoleErrors, failedRequests, badResponses };
 }
-
-

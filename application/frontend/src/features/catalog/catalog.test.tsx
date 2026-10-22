@@ -207,4 +207,3 @@ describe("ProductPage", () => {
     expect(await screen.findByRole("heading", { name: "We couldn't find that product" })).toBeInTheDocument();
   });
 });
-

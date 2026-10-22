@@ -89,4 +89,3 @@ export default function HeroScene({ reducedMotion }: HeroSceneProps) {
     </Canvas>
   );
 }
-

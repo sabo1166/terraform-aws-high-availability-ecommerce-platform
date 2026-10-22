@@ -126,5 +126,3 @@ describe("cart drawer and page", () => {
     expect(await screen.findByText("Your cart is empty")).toBeInTheDocument();
   });
 });
-
-

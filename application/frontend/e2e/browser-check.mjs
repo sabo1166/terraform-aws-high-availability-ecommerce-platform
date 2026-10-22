@@ -303,6 +303,3 @@ try {
   await b.close();
   process.exit(failed.length ? 1 : 0);
 }
-
-
-
