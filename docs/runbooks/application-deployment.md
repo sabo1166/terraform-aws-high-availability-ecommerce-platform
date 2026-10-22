@@ -36,7 +36,7 @@ The delivery-mechanism comparison (Systems Manager vs CodeDeploy, recommending C
 
 ## CI/CD
 
-`.github/workflows/application.yml` runs frontend and backend tests and builds, uploads the build outputs as artifacts, and can run a read-only infrastructure health check. It has **no deploy job** because none of the above exists; adding one before the mechanism is decided would only be a placeholder. Terraform changes still go through `terraform.yml`; application pushes never run `terraform apply`.
+`.github/workflows/application.yml` runs a preflight check, the frontend and backend tests and builds, a production dependency audit, and an optional read-only infrastructure health check, then reports one verdict (see "Application CI pipeline" in `docs/runbooks/ci-cd.md`). Build outputs are uploaded as short-lived artifacts on pushes and manual runs. It has **no deploy job** because none of the above exists; adding one before the mechanism is decided would only be a placeholder. Terraform changes still go through `terraform.yml`; application pushes never run `terraform apply`.
 
 ## Not verified
 

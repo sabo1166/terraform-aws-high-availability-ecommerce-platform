@@ -2,17 +2,22 @@ name: Application CI
 
 ## Continuous integration for the Oriel Node.js/React application (application/frontend, application/backend).
 ##
-## Jobs:
-##   frontend-ci            install, test, production build, upload the build output
-##   backend-ci             MySQL 8 service, install, type check, tests (including the MySQL contract
-##                          tests), production build, upload the build output
-##   infrastructure-check   OPTIONAL, manual only (input check_infrastructure): read-only check of the
-##                          deployed Auto Scaling Groups. It never creates, changes, or deletes anything.
-##   ci-summary             always runs; writes the step summary and fails if a required job failed
+## Stages (job ids in brackets), in the order they run:
+##   1. Preflight        [preflight]              repository prerequisites; optional infrastructure-check settings
+##   2. Quality + build  [frontend-ci, backend-ci] tests, type checks, production builds (parallel with 3)
+##   3. Security         [dependency-audit]       npm audit of the production dependencies (parallel with 2)
+##   4. Infrastructure   [infrastructure-check]   OPTIONAL, manual only (input check_infrastructure): read-only
+##                       check that the deployed Auto Scaling Groups are in service and healthy
+##   5. Summary          [ci-summary]             always runs; one verdict and a results table
 ##
-## Application deployment is NOT implemented: the Terraform resources define no way to deliver code to the
-## private instances (see docs/runbooks/application-deployment.md). Nothing in this workflow deploys.
-## Terraform deployment lives in the separate terraform.yml.
+## There are NO deploy, backend-verification, frontend-deployment or smoke-test stages, on purpose: the
+## Terraform resources define no way to deliver code to the private instances (no artifact bucket, SSM or
+## CodeDeploy; see docs/runbooks/application-deployment.md), and the application has no reachable URL yet.
+## Adding those jobs now would be placeholders that report a deployment that did not happen.
+## Terraform deployment lives in the separate terraform.yml; an application push never runs terraform apply.
+##
+## Actions are pinned to full commit SHAs (the comment gives the release). There is no linter or formatter
+## configured in the applications, so there is no lint stage; the type checks run as part of the build.
 on:
   pull_request:
     paths:
@@ -43,8 +48,84 @@ defaults:
     shell: bash
 
 jobs:
+  ## Cheap checks first, so a missing file or setting fails the run in seconds instead of after the builds.
+  ## Only the NAMES of missing settings are printed, never values.
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: "1. Start the run summary"
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          CHECK_INFRA: ${{ github.event_name == 'workflow_dispatch' && inputs.check_infrastructure }}
+        run: |
+          {
+            echo "## Application CI"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Branch / ref | \`${REF_NAME}\` |"
+            echo "| Event | ${EVENT} (started by ${ACTOR}) |"
+            echo "| Infrastructure check | $([ "$CHECK_INFRA" = "true" ] && echo requested || echo "not requested") |"
+            echo "| Run | ${RUN_URL} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "2. Check out the repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "3. Check the application prerequisites"
+        run: |
+          missing=()
+          for app in frontend backend; do
+            for f in package.json package-lock.json .nvmrc; do
+              [ -f "application/${app}/${f}" ] || missing+=("application/${app}/${f}")
+            done
+            if [ -f "application/${app}/package.json" ]; then
+              for script in test typecheck build; do
+                node -e 'const s = require(process.argv[1]).scripts || {}; process.exit(s[process.argv[2]] ? 0 : 1)' \
+                  "./application/${app}/package.json" "$script" || missing+=("npm script '${script}' in application/${app}/package.json")
+              done
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Preflight failed::Missing: ${missing[*]}"
+            exit 1
+          fi
+          echo "Both applications have a package.json, a lockfile, an .nvmrc and the test, typecheck and build scripts."
+
+      - name: "4. Check the infrastructure-check configuration (only if requested)"
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_infrastructure }}
+        env:
+          HAS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+          HAS_REGION: ${{ vars.AWS_REGION != '' }}
+          HAS_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET != '' }}
+          HAS_STATE_REGION: ${{ vars.TF_STATE_REGION != '' }}
+        run: |
+          missing=()
+          [ "$HAS_ACCESS_KEY" = "true" ] || missing+=("secret AWS_ACCESS_KEY_ID")
+          [ "$HAS_SECRET_KEY" = "true" ] || missing+=("secret AWS_SECRET_ACCESS_KEY")
+          [ "$HAS_REGION" = "true" ] || missing+=("variable AWS_REGION")
+          [ "$HAS_STATE_BUCKET" = "true" ] || missing+=("variable TF_STATE_BUCKET")
+          [ "$HAS_STATE_REGION" = "true" ] || missing+=("variable TF_STATE_REGION")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Missing configuration::Not set: ${missing[*]}. See docs/runbooks/ci-cd.md and bootstrap/README.md."
+            exit 1
+          fi
+          echo "All required secrets and variables are set (values not shown)."
+
   frontend-ci:
     name: "Frontend CI (test, build)"
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
@@ -53,12 +134,12 @@ jobs:
         working-directory: application/frontend
     steps:
       - name: "1. Check out the repository"
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: "2. Set up Node.js (version from application/frontend/.nvmrc)"
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: application/frontend/.nvmrc
           cache: npm
@@ -68,8 +149,9 @@ jobs:
         run: |
           echo "node $(node --version), npm $(npm --version)"
 
+      ## Dependency vulnerabilities are reported by the dependency-audit job, not on every install.
       - name: "4. Install dependencies (npm ci, lockfile only)"
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
       - name: "5. Run frontend tests"
         run: npm test
@@ -85,16 +167,19 @@ jobs:
           fi
           echo "Build output: $(find dist -type f | wc -l) files, $(du -sh dist | cut -f1)"
 
+      ## Nothing deploys this output yet, so it is kept only for runs that are not pull requests, and briefly.
       - name: "8. Upload the frontend build artifact"
-        uses: actions/upload-artifact@v7
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frontend-dist-${{ github.sha }}-${{ github.run_attempt }}
           path: application/frontend/dist
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: error
 
   backend-ci:
     name: "Backend CI (MySQL 8, type check, test, build)"
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
@@ -124,12 +209,12 @@ jobs:
       MYSQL_TEST_DATABASE: oriel_test
     steps:
       - name: "1. Check out the repository"
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: "2. Set up Node.js (version from application/backend/.nvmrc)"
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: application/backend/.nvmrc
           cache: npm
@@ -152,7 +237,7 @@ jobs:
           exit 1
 
       - name: "5. Install dependencies (npm ci, lockfile only)"
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
       - name: "6. Type check"
         run: npm run typecheck
@@ -213,22 +298,67 @@ jobs:
           [ "$missing" -eq 0 ]
           echo "Build output: $(find dist -type f | wc -l) files"
 
+      ## Nothing deploys this output yet, so it is kept only for runs that are not pull requests, and briefly.
       - name: "12. Upload the backend build artifact"
-        uses: actions/upload-artifact@v7
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: backend-dist-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             application/backend/dist
             application/backend/package.json
             application/backend/package-lock.json
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: error
 
-  ## Optional and read-only. Skipped (not failed) unless the manual input is enabled. Requires the remote
-  ## state and AWS access keys in the repository secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (see
-  ## docs/runbooks/ci-cd.md); none exist yet. No GitHub Environment is used, so these are the same
-  ## repository-level keys as the Terraform plan identity. Only reads: terraform init (backend read),
-  ## terraform output, and autoscaling:DescribeAutoScalingGroups.
+  ## Reads only the lockfiles (no install) and asks the npm registry about known vulnerabilities in the
+  ## production dependencies. High and critical advisories fail the run; lower ones are listed but allowed.
+  ## A new advisory can fail an unchanged commit: update the dependency (or review the advisory) to fix it.
+  dependency-audit:
+    name: "Security: dependency audit (production)"
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: "1. Check out the repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "2. Set up Node.js (version from application/backend/.nvmrc)"
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: application/backend/.nvmrc
+
+      - name: "3. Audit the production dependencies of both applications"
+        run: |
+          failed=0
+          {
+            echo "### Dependency audit (production dependencies, fails on high or critical)"
+            echo
+            echo "| Application | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for app in backend frontend; do
+            echo "::group::npm audit (application/${app})"
+            if (cd "application/${app}" && npm audit --package-lock-only --omit=dev --audit-level=high --fetch-retries=3); then
+              result="no high or critical advisories"
+            else
+              result="FAILED (high/critical advisory, or the registry could not be reached)"
+              echo "::error title=Dependency audit failed (${app})::npm audit reported high or critical advisories for application/${app}, or could not reach the registry. See the log above."
+              failed=1
+            fi
+            echo "::endgroup::"
+            echo "| ${app} | ${result} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          [ "$failed" -eq 0 ]
+
+  ## Optional and read-only. Skipped (not failed) unless the manual input is enabled; its settings were already
+  ## checked by the preflight job. Requires the remote state and the AWS access keys in the repository secrets
+  ## AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (see docs/runbooks/ci-cd.md). No GitHub Environment is used, so
+  ## these are the same repository-level keys as the Terraform plan identity. Only reads: terraform init
+  ## (backend read), terraform output, and autoscaling:DescribeAutoScalingGroups. It is a health gate for a
+  ## future deploy stage and a diagnostic today; it changes nothing.
   infrastructure-check:
     name: "Infrastructure check (optional, read-only)"
     needs: [frontend-ci, backend-ci]
@@ -238,46 +368,25 @@ jobs:
     permissions:
       contents: read
     steps:
-      ## Names only: values are never printed, and missing items are all listed in one message.
-      - name: "1. Validate the required configuration"
-        env:
-          HAS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
-          HAS_SECRET_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
-          HAS_REGION: ${{ vars.AWS_REGION != '' }}
-          HAS_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET != '' }}
-          HAS_STATE_REGION: ${{ vars.TF_STATE_REGION != '' }}
-        run: |
-          missing=()
-          [ "$HAS_ACCESS_KEY" = "true" ] || missing+=("secret AWS_ACCESS_KEY_ID")
-          [ "$HAS_SECRET_KEY" = "true" ] || missing+=("secret AWS_SECRET_ACCESS_KEY")
-          [ "$HAS_REGION" = "true" ] || missing+=("variable AWS_REGION")
-          [ "$HAS_STATE_BUCKET" = "true" ] || missing+=("variable TF_STATE_BUCKET")
-          [ "$HAS_STATE_REGION" = "true" ] || missing+=("variable TF_STATE_REGION")
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error title=Missing configuration::Not set: ${missing[*]}. See docs/runbooks/ci-cd.md and bootstrap/README.md."
-            exit 1
-          fi
-          echo "All required secrets and variables are set (values not shown)."
-
-      - name: "2. Check out the repository"
-        uses: actions/checkout@v7
+      - name: "1. Check out the repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: "3. Set up Terraform"
-        uses: hashicorp/setup-terraform@v4
+      - name: "2. Set up Terraform"
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: "^1.10.0"
           terraform_wrapper: false
 
-      - name: "4. Configure AWS credentials (access keys, read-only use)"
-        uses: aws-actions/configure-aws-credentials@v6
+      - name: "3. Configure AWS credentials (access keys, read-only use)"
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: "5. Confirm AWS accepts the credentials (identity is not printed)"
+      - name: "4. Confirm AWS accepts the credentials (identity is not printed)"
         run: |
           if aws sts get-caller-identity --query Account --output text > /dev/null 2>&1; then
             echo "AWS accepted the credentials."
@@ -286,7 +395,7 @@ jobs:
             exit 1
           fi
 
-      - name: "6. Initialise the S3 backend (read-only use)"
+      - name: "5. Initialise the S3 backend (read-only use)"
         working-directory: environments/dev
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
@@ -301,14 +410,22 @@ jobs:
           fi
 
       ## Uses the real Terraform outputs frontend_asg_name and backend_asg_name. The ASGs use ELB health
-      ## checks, so an instance reported Healthy here has passed its load balancer health check.
-      - name: "7. Verify both Auto Scaling Groups are in service and healthy"
+      ## checks, so an instance reported Healthy here has passed its load balancer health check. Diagnostics:
+      ## the target groups and the ASG activity history in the EC2 console, and the CloudWatch alarms.
+      - name: "6. Verify both Auto Scaling Groups are in service and healthy"
         working-directory: environments/dev
         run: |
           failed=0
+          {
+            echo "### Infrastructure check (read-only)"
+            echo
+            echo "| Auto Scaling Group output | In service and healthy | Total |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
           for output in frontend_asg_name backend_asg_name; do
             if ! ASG="$(terraform output -raw "$output" 2>/dev/null)" || [ -z "$ASG" ]; then
               echo "::error title=Terraform output missing::Output '${output}' is not in the remote state. Has the dev stack been applied?"
+              echo "| ${output} | output missing | |" >> "$GITHUB_STEP_SUMMARY"
               failed=1
               continue
             fi
@@ -320,6 +437,7 @@ jobs:
               --query 'length(AutoScalingGroups[0].Instances[?LifecycleState==`InService` && HealthStatus==`Healthy`])' \
               --output text)"
             echo "${output}: ${HEALTHY}/${TOTAL} instance(s) in service and healthy"
+            echo "| ${output} | ${HEALTHY} | ${TOTAL} |" >> "$GITHUB_STEP_SUMMARY"
             if [ "$TOTAL" = "None" ] || [ "$TOTAL" -lt 1 ] || [ "$HEALTHY" != "$TOTAL" ]; then
               echo "::error title=Auto Scaling Group not healthy::${output} has ${HEALTHY}/${TOTAL} healthy in-service instances."
               failed=1
@@ -327,11 +445,11 @@ jobs:
           done
           [ "$failed" -eq 0 ]
 
-  ## Always runs, so the run has one clear verdict. Frontend and backend CI are required; the optional
-  ## infrastructure check may be skipped but must not have failed or been cancelled.
+  ## Always runs, so the run has one clear verdict. Preflight, frontend, backend and the dependency audit
+  ## are required; the optional infrastructure check may be skipped but must not have failed or been cancelled.
   ci-summary:
     name: CI Summary
-    needs: [frontend-ci, backend-ci, infrastructure-check]
+    needs: [preflight, frontend-ci, backend-ci, dependency-audit, infrastructure-check]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -339,27 +457,36 @@ jobs:
     steps:
       - name: "Report results and fail if required CI did not pass"
         env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           FRONTEND_RESULT: ${{ needs.frontend-ci.result }}
           BACKEND_RESULT: ${{ needs.backend-ci.result }}
+          AUDIT_RESULT: ${{ needs.dependency-audit.result }}
           INFRA_RESULT: ${{ needs.infrastructure-check.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           {
             echo "## CI Summary"
             echo
-            echo "| Job | Result | Required |"
-            echo "| --- | --- | --- |"
-            echo "| Frontend CI | ${FRONTEND_RESULT} | yes |"
-            echo "| Backend CI | ${BACKEND_RESULT} | yes |"
-            echo "| Infrastructure check | ${INFRA_RESULT} | no (optional, manual) |"
+            echo "| Stage | Job | Result | Required |"
+            echo "| --- | --- | --- | --- |"
+            echo "| Preflight | Preflight | ${PREFLIGHT_RESULT} | yes |"
+            echo "| Quality + build | Frontend CI | ${FRONTEND_RESULT} | yes |"
+            echo "| Quality + build | Backend CI | ${BACKEND_RESULT} | yes |"
+            echo "| Security | Dependency audit | ${AUDIT_RESULT} | yes |"
+            echo "| Infrastructure | Infrastructure check | ${INFRA_RESULT} | no (optional, manual) |"
             echo
-            echo "Commit: \`${GITHUB_SHA}\`. Nothing was deployed by this workflow."
+            echo "Commit \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`. **Nothing was deployed** (application deployment is not implemented, see \`docs/runbooks/application-deployment.md\`), so there is no application URL and no deployment health check or smoke test. Run: ${RUN_URL}"
           } >> "$GITHUB_STEP_SUMMARY"
 
           failed=0
-          for pair in "Frontend CI:${FRONTEND_RESULT}" "Backend CI:${BACKEND_RESULT}"; do
-            name="${pair%%:*}"; result="${pair#*:}"
+          for entry in "Preflight:${PREFLIGHT_RESULT}" "Frontend CI:${FRONTEND_RESULT}" "Backend CI:${BACKEND_RESULT}" "Dependency audit:${AUDIT_RESULT}"; do
+            name="${entry%%:*}"; result="${entry#*:}"
+            ## When Preflight failed the other jobs were skipped on purpose: report only the root cause.
+            if [ "$result" = "skipped" ] && [ "$PREFLIGHT_RESULT" != "success" ]; then
+              continue
+            fi
             if [ "$result" != "success" ]; then
-              echo "::error title=${name} did not pass::Result: ${result}. Open the '${name}' job to see the failed step."
+              echo "::error title=${name} did not pass::Result: ${result}. Open the '${name}' job to see the failed step (a skipped job means an earlier required job failed)."
               failed=1
             fi
           done
