@@ -1,0 +1,10 @@
+## Export the web ACL for CloudFront.
+output "web_acl_arn" {
+  description = "ARN of the CloudFront-scoped web ACL."
+  value       = aws_wafv2_web_acl.this.arn
+}
+
+output "web_acl_name" {
+  description = "Name of the web ACL."
+  value       = aws_wafv2_web_acl.this.name
+}

@@ -1,0 +1,18 @@
+## Copy this file to terraform.tfvars only when you need environment-specific values.
+## Do not put passwords, access keys, or other secrets in this file.
+
+project_name      = "ha-ecommerce"
+environment       = "dev"
+aws_region        = "us-east-1"
+az_count          = 2
+vpc_cidr          = "10.0.0.0/16"
+enable_nat_gateway = true
+single_nat_gateway = true
+
+## Required inputs with no default (supply your own values; do not commit secrets):
+##   domain_name              - domain served by CloudFront, inside your Route 53 zone
+##   route53_hosted_zone_id   - ID of the existing Route 53 hosted zone
+##   alb_logs_bucket_name     - globally unique S3 bucket name for ALB logs
+## Secret, supply through the environment instead of this file:
+##   $env:TF_VAR_origin_verify_header_value = "<random string of 16+ characters>"
+## Optional: subject_alternative_names, alarm_email_addresses, frontend, backend, db_* settings.

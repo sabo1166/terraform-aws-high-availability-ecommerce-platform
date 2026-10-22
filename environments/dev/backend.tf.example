@@ -1,0 +1,19 @@
+## Example S3 backend for the dev stack. Do not commit real values.
+##
+## Backend blocks cannot use Terraform variables, locals, or references, so the
+## bucket name must be written literally or supplied at init time:
+##
+##   terraform init -backend-config="bucket=<state-bucket-name>" -backend-config="region=<bucket-region>"
+##
+## To use it, copy this file to backend.tf (or keep it as a partial configuration).
+## Requires Terraform 1.10+ for use_lockfile (S3 native locking; no DynamoDB table).
+## Credentials come from the standard AWS environment/profile, never from this file.
+terraform {
+  backend "s3" {
+    ## bucket = "<supplied via -backend-config>"
+    ## region = "<supplied via -backend-config>"
+    key          = "ha-ecommerce/dev/terraform.tfstate"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
