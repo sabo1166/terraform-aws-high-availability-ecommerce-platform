@@ -108,14 +108,25 @@ jobs:
       plan_sha256: ${{ steps.meta.outputs.plan_sha256 }}
     steps:
       ## The remote state bucket comes from the bootstrap stack. Without it, stop here instead of
-      ## falling back to local state.
-      - name: 1-pre. INIT - require a bootstrapped remote state
+      ## falling back to local state. Only the NAMES of missing settings are reported, never values.
+      - name: 1-pre. INIT - require the backend variables and credentials
         env:
           STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
           STATE_REGION: ${{ vars.TF_STATE_REGION }}
+          AWS_REGION_VAR: ${{ vars.AWS_REGION }}
+          HAS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+          HAS_PLAN_KEY: ${{ secrets.TFPLAN_ENCRYPTION_KEY != '' }}
         run: |
-          if [ -z "$STATE_BUCKET" ] || [ -z "$STATE_REGION" ]; then
-            echo "::error::TF_STATE_BUCKET and TF_STATE_REGION are not set. Apply the bootstrap stack first (bootstrap/README.md)."
+          MISSING=""
+          [ -n "$STATE_BUCKET" ] || MISSING="$MISSING TF_STATE_BUCKET"
+          [ -n "$STATE_REGION" ] || MISSING="$MISSING TF_STATE_REGION"
+          [ -n "$AWS_REGION_VAR" ] || MISSING="$MISSING AWS_REGION"
+          [ "$HAS_ACCESS_KEY_ID" = "true" ] || MISSING="$MISSING AWS_ACCESS_KEY_ID"
+          [ "$HAS_SECRET_ACCESS_KEY" = "true" ] || MISSING="$MISSING AWS_SECRET_ACCESS_KEY"
+          [ "$HAS_PLAN_KEY" = "true" ] || MISSING="$MISSING TFPLAN_ENCRYPTION_KEY"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required settings:${MISSING}. Apply the bootstrap stack first and configure the variables and secrets (bootstrap/README.md, docs/runbooks/ci-cd.md)."
             exit 1
           fi
 
@@ -242,8 +253,9 @@ jobs:
     name: Apply saved plan
     needs: plan
     ## Only on the deployment branch (repository variable TF_DEPLOY_BRANCH, default master), only when
-    ## "apply" is selected, and only after the whole plan job (init, validate, plan) succeeded.
-    if: ${{ inputs.apply && github.ref_name == (vars.TF_DEPLOY_BRANCH || 'master') }}
+    ## "apply" is selected, and only after the whole plan job (init, validate, plan) succeeded: if any of
+    ## those stages fails, is cancelled or is skipped, this job is skipped. It never creates a new plan.
+    if: ${{ success() && needs.plan.result == 'success' && inputs.apply && github.ref_name == (vars.TF_DEPLOY_BRANCH || 'master') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     ## The "dev-apply" Environment holds the apply identity's AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as
