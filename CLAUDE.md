@@ -46,4 +46,4 @@ Use `python -B` so `__pycache__` is not created.
 
 ## Current state
 
-All 13 modules, `environments/dev`, and the Oriel application exist and validate/test locally. Not done: deploying the application (no mechanism in Terraform), remote state in use, HTTPS to the origin, per-tier IAM roles, scaling policies, Glue table, MySQL and browser verification. `lambda/automation` and a few test/doc directories are empty.
+All 14 modules (including `delivery`, the Phase 1 CodeDeploy foundation: written and validated offline, not planned or applied), `environments/dev`, and the Oriel application exist and validate/test locally. Not done: deploying the application (Phase 2 onward of `docs/architecture/deployment-delivery-design.md`), HTTPS to the origin, scaling policies, Glue table, MySQL and browser verification. `lambda/automation` and a few test/doc directories are empty.

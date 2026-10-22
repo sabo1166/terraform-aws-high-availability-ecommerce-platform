@@ -2,6 +2,27 @@
 
 Status: **design only. Nothing in this document is implemented, planned, applied, or tested on AWS.** Facts marked *verified* come from reading this repository (file references given) or from GitHub Actions run metadata. Statements about AWS service behavior come from general knowledge and are marked *assumption*: re-check them against current AWS documentation and prove them in a throwaway environment before building. Decisions that need your approval are collected in section 14.
 
+## Phase 1 status
+
+Phase 1 (the Terraform foundation) is **written and validated offline, but not planned, applied or tested on AWS**. What exists:
+
+- `modules/delivery`: private versioned SSE-S3 artifact bucket (TLS-only policy), CodeDeploy application, service role, frontend and backend deployment groups (in-place, traffic control, rollback on failure), per-tier read policies, the JWT secret container (no value), and an optional GitHub OIDC deploy role. See its README.
+- `modules/iam`: per-tier instance roles and profiles (the old shared role is kept unused so nothing is deleted).
+- `modules/compute`: user data that installs the CodeDeploy agent and the runtime and writes non-secret settings to `/etc/oriel/deploy.env`; it does not install or start the application.
+- `modules/alb`, `modules/database`, `modules/monitoring`: new outputs only (target group names, database name and user, unhealthy-host alarm names).
+- `environments/dev`: wiring, new variables, new outputs. `terraform.yml` passes `TF_VAR_github_repository` from the run context so the OIDC role is pinned to this repository.
+
+Decisions taken while implementing, and what is still open:
+
+- **Credentials:** GitHub OIDC (decision 1 resolved as the design recommended). It needs the GitHub Environment `app-deploy` to exist, and an account can have only one GitHub OIDC provider (pass `github_oidc_provider_arn` if one exists).
+- **Alarm gating off by default** (`enable_deployment_alarm_gating = false`): the unhealthy-host alarms are in ALARM while no application runs, and CodeDeploy would refuse or stop deployments because of them. Turn it on after the first successful deployment.
+- **First-deployment gap (decision 4) is NOT resolved and `health_check_type` stays `ELB`.** After the apply, instances still fail health checks and are replaced until a first revision is deployed; user data changes also start an instance refresh that cannot reach 50% healthy while that is true. The safe order is to apply Phase 1, then deploy the first revision as soon as Phase 2 exists, and to decide explicitly whether to switch the health check type temporarily. Do not switch it silently.
+- **Terraform apply identity:** it must be allowed to create the new resources (S3, CodeDeploy, IAM roles and policies, Secrets Manager, an OIDC provider). Its permission set is not defined in this repository, so a first apply may fail on permissions.
+- **JWT secret value:** must be set outside Terraform before the first backend deployment.
+- **Deletion guard:** the plan should contain no deletions or replacements from this change (the shared IAM role is retained). If the saved plan shows any, stop and review.
+- **Compute now depends on the database module** (database host in user data), so the first apply creates the database before the instances.
+- Still open from section 14: items 3, 5 to 13.
+
 ## 1. Summary
 
 - **Recommended mechanism:** AWS CodeDeploy (EC2/on-premises platform, in-place rolling deployments) with immutable, versioned bundles in a private, versioned, encrypted S3 bucket. GitHub Actions builds and publishes the bundles and starts the deployments; CodeDeploy runs them on the instances, gating on load balancer health and CloudWatch alarms, and rolls back automatically.

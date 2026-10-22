@@ -1,16 +1,44 @@
 #!/bin/bash
-## Placeholder bootstrap for the ${tier} tier (${environment}). It installs no application.
+## Base bootstrap for the ${tier} tier (${environment}) on Amazon Linux 2023. It prepares the instance to RECEIVE
+## the application through CodeDeploy: it installs the Node.js runtime and the CodeDeploy agent, creates the
+## service user and directories, and writes the non-secret settings the deployment scripts need. It does NOT
+## install the application and does NOT start a service, so nothing answers the load balancer health check until a
+## deployment succeeds. No secret belongs in this file: database and JWT secrets are read from Secrets Manager by
+## the deployment scripts at deploy time. Not yet tested on AWS: package names and the agent installer must be
+## proven in a throwaway environment first (docs/architecture/deployment-delivery-design.md).
 set -euo pipefail
 
 LOG_FILE=/var/log/bootstrap.log
 exec >>"$LOG_FILE" 2>&1
 
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) bootstrap started: tier=${tier} environment=${environment}"
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+trap 'log "bootstrap FAILED near line $LINENO"' ERR
 
-## TODO: install the backend runtime (runtime and version not yet decided).
-## TODO: fetch and deploy the backend artifact (delivery mechanism not yet decided).
-## TODO: serve the health-check path configured on the ALB target group; none is verified yet.
-## TODO: obtain database credentials from a secrets manager once the database module exists.
-## TODO: ship the bootstrap log to CloudWatch Logs with the CloudWatch agent.
+log "bootstrap started: tier=${tier} environment=${environment}"
 
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) bootstrap finished: no application installed"
+## Prerequisites for the CodeDeploy agent installer, and the Node.js runtime package for this tier.
+dnf install -y ruby wget ${runtime_package}
+
+## Non-secret settings for the deployment scripts (world-readable on purpose; secrets are read at deploy time).
+install -d -m 0755 /etc/oriel
+cat >/etc/oriel/deploy.env <<'ORIEL_DEPLOY_ENV'
+${config_env}
+ORIEL_DEPLOY_ENV
+chmod 0644 /etc/oriel/deploy.env
+
+## Unprivileged service user and the directory the backend release is installed into by the deployment.
+id oriel >/dev/null 2>&1 || useradd --system --shell /sbin/nologin --home-dir /opt/oriel oriel
+install -d -m 0755 -o root -g root /opt/oriel
+install -d -m 0755 -o root -g root /opt/oriel/backend
+
+## CodeDeploy agent from the public regional bucket (HTTPS). The installer is not pinned to a version.
+cd /tmp
+wget --tries=5 --waitretry=5 -q "https://aws-codedeploy-${aws_region}.s3.${aws_region}.amazonaws.com/latest/install" -O codedeploy-install
+chmod +x codedeploy-install
+./codedeploy-install auto
+rm -f codedeploy-install
+
+systemctl enable --now codedeploy-agent
+systemctl is-active --quiet codedeploy-agent
+
+log "bootstrap finished: CodeDeploy agent running, no application installed"

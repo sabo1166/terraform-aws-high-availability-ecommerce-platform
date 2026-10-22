@@ -54,3 +54,13 @@ output "backend_target_group_arn" {
   description = "ARN of the backend target group."
   value       = aws_lb_target_group.backend.arn
 }
+
+output "frontend_target_group_name" {
+  description = "Name of the frontend target group (CodeDeploy traffic control refers to target groups by name)."
+  value       = aws_lb_target_group.frontend.name
+}
+
+output "backend_target_group_name" {
+  description = "Name of the backend target group (CodeDeploy traffic control refers to target groups by name)."
+  value       = aws_lb_target_group.backend.name
+}

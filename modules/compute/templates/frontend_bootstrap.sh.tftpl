@@ -1,15 +1,42 @@
 #!/bin/bash
-## Placeholder bootstrap for the ${tier} tier (${environment}). It installs no application.
+## Base bootstrap for the ${tier} tier (${environment}) on Amazon Linux 2023. It prepares the instance to RECEIVE
+## the application through CodeDeploy: it installs Nginx and the CodeDeploy agent and writes the non-secret
+## settings the deployment scripts need. It does NOT install the application and does NOT start Nginx, so
+## nothing answers the load balancer health check (and no default page is served) until a deployment succeeds.
+## No secret belongs in this file. Not yet tested on AWS: package names and the agent installer must be proven in
+## a throwaway environment first (docs/architecture/deployment-delivery-design.md).
 set -euo pipefail
 
 LOG_FILE=/var/log/bootstrap.log
 exec >>"$LOG_FILE" 2>&1
 
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) bootstrap started: tier=${tier} environment=${environment}"
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+trap 'log "bootstrap FAILED near line $LINENO"' ERR
 
-## TODO: install and configure the frontend web server (package and version not yet decided).
-## TODO: fetch and deploy the frontend artifact (delivery mechanism not yet decided).
-## TODO: serve the health-check path configured on the ALB target group; none is verified yet.
-## TODO: ship the bootstrap log to CloudWatch Logs with the CloudWatch agent.
+log "bootstrap started: tier=${tier} environment=${environment}"
 
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) bootstrap finished: no application installed"
+## Prerequisites for the CodeDeploy agent installer, and Nginx for this tier.
+dnf install -y ruby wget nginx
+
+## Non-secret settings for the deployment scripts (world-readable on purpose; secrets are read at deploy time).
+install -d -m 0755 /etc/oriel
+cat >/etc/oriel/deploy.env <<'ORIEL_DEPLOY_ENV'
+${config_env}
+ORIEL_DEPLOY_ENV
+chmod 0644 /etc/oriel/deploy.env
+
+## Directory the frontend release is installed into by the deployment.
+install -d -m 0755 /var/www/oriel
+
+## CodeDeploy agent from the public regional bucket (HTTPS). The installer is not pinned to a version.
+cd /tmp
+wget --tries=5 --waitretry=5 -q "https://aws-codedeploy-${aws_region}.s3.${aws_region}.amazonaws.com/latest/install" -O codedeploy-install
+chmod +x codedeploy-install
+./codedeploy-install auto
+rm -f codedeploy-install
+
+systemctl enable --now codedeploy-agent
+systemctl is-active --quiet codedeploy-agent
+
+## Nginx is installed but neither enabled nor started: the deployment's ApplicationStart step starts it.
+log "bootstrap finished: CodeDeploy agent running, no application installed"

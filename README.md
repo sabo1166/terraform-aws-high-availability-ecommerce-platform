@@ -39,7 +39,7 @@ Route 53 -> CloudFront (+ ACM certificate, + WAF) -> Public ALB
 | --- | --- |
 | `bootstrap/` | Separate stack (local state) for the remote-state S3 bucket. |
 | `environments/dev/` | Root configuration that wires all modules together. |
-| `modules/` | `network`, `security`, `iam`, `logging`, `alb`, `compute`, `database`, `monitoring`, `automation`, `acm`, `waf`, `cloudfront`, `dns`; each has a README. |
+| `modules/` | `network`, `security`, `iam`, `logging`, `alb`, `compute`, `database`, `monitoring`, `automation`, `acm`, `waf`, `cloudfront`, `dns`, `delivery` (CodeDeploy foundation, written but not applied); each has a README. |
 | `lambda/health-monitor/` | Source for the health monitor Lambda. |
 | `modules/automation/src/` | Source for the alarm logger Lambda. |
 | `tests/lambda/`, `modules/automation/tests/` | Python unit tests. |

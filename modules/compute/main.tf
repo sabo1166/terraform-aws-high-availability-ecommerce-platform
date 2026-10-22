@@ -9,21 +9,27 @@ locals {
   ## Frontend and backend differ only in these values, so both tiers share the resources below.
   tiers = {
     frontend = {
-      sizing             = var.frontend
-      security_group_id  = var.frontend_security_group_id
-      target_group_arn   = var.frontend_target_group_arn
-      bootstrap_template = "${path.module}/templates/frontend_bootstrap.sh.tftpl"
+      sizing                = var.frontend
+      security_group_id     = var.frontend_security_group_id
+      target_group_arn      = var.frontend_target_group_arn
+      instance_profile_name = var.frontend_instance_profile_name
+      app_config            = var.frontend_app_config
+      bootstrap_template    = "${path.module}/templates/frontend_bootstrap.sh.tftpl"
     }
     backend = {
-      sizing             = var.backend
-      security_group_id  = var.backend_security_group_id
-      target_group_arn   = var.backend_target_group_arn
-      bootstrap_template = "${path.module}/templates/backend_bootstrap.sh.tftpl"
+      sizing                = var.backend
+      security_group_id     = var.backend_security_group_id
+      target_group_arn      = var.backend_target_group_arn
+      instance_profile_name = var.backend_instance_profile_name
+      app_config            = var.backend_app_config
+      bootstrap_template    = "${path.module}/templates/backend_bootstrap.sh.tftpl"
     }
   }
 
   ami_id = coalesce(var.ami_id, one(data.aws_ssm_parameter.al2023[*].insecure_value))
 }
+
+data "aws_region" "current" {}
 
 ## Latest Amazon Linux 2023 AMI from the public AWS parameter, used only when ami_id is not set.
 ## The AMI ID is not a secret, so insecure_value avoids marking the launch template sensitive.
@@ -43,7 +49,7 @@ resource "aws_launch_template" "this" {
   instance_type = each.value.sizing.instance_type
 
   iam_instance_profile {
-    name = var.instance_profile_name
+    name = each.value.instance_profile_name
   }
 
   ## Require IMDSv2 so credential theft through SSRF cannot use the legacy metadata service.
@@ -72,10 +78,15 @@ resource "aws_launch_template" "this" {
     }
   }
 
-  ## Placeholder bootstrap only: it logs the tier and installs no application. See the template TODOs.
+  ## Base bootstrap: installs the runtime and the CodeDeploy agent and writes non-secret settings; the application
+  ## itself arrives through CodeDeploy. Changing it creates a new launch template version and so triggers the
+  ## rolling instance refresh below.
   user_data = base64encode(templatefile(each.value.bootstrap_template, {
-    tier        = each.key
-    environment = var.environment
+    tier            = each.key
+    environment     = var.environment
+    aws_region      = data.aws_region.current.name
+    runtime_package = var.backend_runtime_package
+    config_env      = join("\n", [for key in sort(keys(each.value.app_config)) : "${key}='${each.value.app_config[key]}'"])
   }))
 
   ## Provider default_tags do not reach instances launched by Auto Scaling, so tag them here.

@@ -2,6 +2,8 @@
 
 Status: **application deployment is not implemented and has never been run.** The application builds and passes its tests locally, but the Terraform resources define no way to get code onto the instances. This page records what the code needs, what the existing Terraform provides, and the smallest secure changes recommended. Nothing here was verified on AWS.
 
+> Update: the Terraform in `modules/delivery`, `modules/iam` and `modules/compute` now defines an artifact bucket, CodeDeploy, per-tier roles and an agent-installing bootstrap (Phase 1 of `docs/architecture/deployment-delivery-design.md`). It is written and validated offline only; it has not been planned or applied. The list below describes the infrastructure as deployed before that change.
+
 ## What the Terraform in this repository provides (read from the code)
 
 - Frontend and backend instances are in **private subnets**, no public IPs, no SSH rule, IMDSv2 required (`modules/compute`, `modules/security`).

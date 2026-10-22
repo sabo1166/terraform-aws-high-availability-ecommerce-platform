@@ -198,3 +198,34 @@ variable "backend_health_check_path" {
   type        = string
   default     = "/healthz"
 }
+
+## Application delivery (see docs/architecture/deployment-delivery-design.md). Nothing is deployed by these settings.
+variable "deployment_config_name" {
+  description = "Built-in CodeDeploy rolling configuration: CodeDeployDefault.OneAtATime or CodeDeployDefault.HalfAtATime."
+  type        = string
+  default     = "CodeDeployDefault.OneAtATime"
+}
+
+variable "enable_deployment_alarm_gating" {
+  description = "Let the unhealthy-host alarms stop a deployment and trigger a rollback. Keep false until a first deployment has succeeded and the alarms are OK."
+  type        = bool
+  default     = false
+}
+
+variable "github_repository" {
+  description = "GitHub repository (owner/name) allowed to assume the OIDC deploy role. Null creates no deploy identity. The Terraform workflow supplies it automatically."
+  type        = string
+  default     = null
+}
+
+variable "github_environment" {
+  description = "GitHub Environment whose jobs may assume the deploy role. Create it in the repository settings before the first deployment."
+  type        = string
+  default     = "app-deploy"
+}
+
+variable "github_oidc_provider_arn" {
+  description = "ARN of an existing GitHub OIDC provider in this account; null creates one (an account can have only one)."
+  type        = string
+  default     = null
+}

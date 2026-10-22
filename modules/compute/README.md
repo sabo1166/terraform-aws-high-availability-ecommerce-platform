@@ -2,7 +2,7 @@
 
 Creates the frontend and backend Launch Templates and Auto Scaling Groups.
 
-Status: **validate-only.** The module is statically validated, but it is not connected to `environments/dev`, and nothing has been planned, applied, or run on AWS. The bootstrap is a placeholder; no application is installed.
+Status: statically validated only; nothing in this module has been tested on AWS. The bootstrap now prepares each instance to receive the application through CodeDeploy (agent, runtime, directories, non-secret settings) but installs no application, so instances still fail their load balancer health checks until a first deployment succeeds.
 
 ## Resources
 
@@ -13,7 +13,8 @@ Both tiers are created with `for_each` over `frontend` and `backend` (addresses 
   - IMDSv2 required (`http_tokens = "required"`, hop limit 1).
   - No public IP; the tier's existing security group.
   - Encrypted gp3 root volume (account default EBS key).
-  - Shared EC2 instance profile.
+  - Per-tier EC2 instance profile.
+  - User data: installs the CodeDeploy agent and Nginx (frontend) or the Node.js runtime package (backend) and writes `/etc/oriel/deploy.env` from `frontend_app_config` / `backend_app_config` (non-secret values only). Nginx is installed but not started.
   - Instance and volume tags (provider `default_tags` do not reach Auto Scaling launches).
 - `aws_autoscaling_group.this`: private application subnets, `health_check_type = "ELB"`, target group registration, rolling instance refresh on launch template changes.
 - `data.aws_ssm_parameter.al2023`: only when `ami_id` is null.
@@ -25,7 +26,9 @@ Both tiers are created with `for_each` over `frontend` and `backend` (addresses 
 | `project_name`, `environment` | Naming and tags | required |
 | `private_app_subnet_ids` | Private app subnets (at least 2) | required |
 | `frontend_security_group_id`, `backend_security_group_id` | Security group per tier | required |
-| `instance_profile_name` | Shared EC2 instance profile | required |
+| `frontend_instance_profile_name`, `backend_instance_profile_name` | Instance profile per tier | required |
+| `frontend_app_config`, `backend_app_config` | Non-secret settings written to `/etc/oriel/deploy.env` (UPPER_SNAKE keys; restricted value characters) | `{}` |
+| `backend_runtime_package` | AL2023 package providing Node.js | `nodejs22` (not verified on AWS) |
 | `frontend_target_group_arn`, `backend_target_group_arn` | ALB target groups | required |
 | `ami_id` | Optional AMI override | `null` |
 | `frontend`, `backend` | Object: `instance_type`, `min_size`, `max_size`, `desired_capacity`, `root_volume_size` | `t3.micro`, 2, 4, 2, 20 |

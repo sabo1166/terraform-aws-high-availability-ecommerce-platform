@@ -36,6 +36,15 @@ GitHub **repository-level variables** (the init and plan jobs have no Environmen
 - Access boundary (intended): the init and plan jobs have no Environment and use the repository-level keys; the apply job runs in `dev-apply` and is meant to use that Environment's keys. The `validate` job, the `offline-validate` job and pull requests use no AWS credentials. The workflow only references `secrets.AWS_ACCESS_KEY_ID` / `secrets.AWS_SECRET_ACCESS_KEY` in each job; it does **not** verify that the Environment holds different keys (see the limitations below).
 - Fresh runners: every job starts on a clean runner, so nothing under `.terraform` is carried between jobs. The init, plan and apply jobs each set up Terraform and initialise the same S3 backend (`backend.tf.example` copied to `backend.tf` at run time, bucket and region from the variables); the validate job uses `-backend=false`. Between jobs only the plan job's non-secret outputs (artifact name, commit SHA, plan SHA-256) and the encrypted plan artifact are passed. The init, validate and plan jobs check out `github.sha`; the apply job checks out the commit recorded by the plan job.
 
+### Delivery foundation prerequisites (Phase 1 Terraform, not yet applied)
+
+- The plan job passes `TF_VAR_github_repository` (from `github.repository`) so Terraform can create the GitHub OIDC deploy role pinned to this repository. No secret is involved.
+- Create the GitHub Environment `app-deploy` (the name pinned in the role's trust policy), restrict its deployment branches to the deployment branch, and add reviewers if you want approval. Nothing in the pipeline uses it yet.
+- An AWS account can have only one GitHub OIDC provider. If one exists, set `github_oidc_provider_arn` for `environments/dev`; otherwise the apply fails with an "already exists" error.
+- The IAM user behind the Terraform apply identity must be allowed to create the new resources (S3, CodeDeploy, IAM roles and policies, Secrets Manager, an OIDC provider). That permission set is not defined here.
+- Set the JWT secret value in Secrets Manager outside Terraform before the first backend deployment (never in the repository).
+- Details and open decisions: `docs/architecture/deployment-delivery-design.md`, section "Phase 1 status".
+
 ### Application CI pipeline (`application.yml`)
 
 Stages and dependencies:

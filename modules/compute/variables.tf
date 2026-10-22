@@ -30,9 +30,50 @@ variable "backend_security_group_id" {
   type        = string
 }
 
-variable "instance_profile_name" {
-  description = "Name of the shared EC2 instance profile attached to both tiers."
+variable "frontend_instance_profile_name" {
+  description = "Name of the EC2 instance profile attached to frontend instances."
   type        = string
+}
+
+variable "backend_instance_profile_name" {
+  description = "Name of the EC2 instance profile attached to backend instances."
+  type        = string
+}
+
+## Non-secret settings written to /etc/oriel/deploy.env on each instance for the deployment scripts. Keys are
+## upper-case names; values are limited to characters that are safe inside a single-quoted shell string.
+## Never put a secret here: user data is readable from the instance metadata and the console.
+variable "frontend_app_config" {
+  description = "Non-secret key/value settings for frontend instances (written to /etc/oriel/deploy.env)."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for k, v in var.frontend_app_config : can(regex("^[A-Z][A-Z0-9_]*$", k)) && can(regex("^[A-Za-z0-9._:/@=,+!-]*$", v))])
+    error_message = "Keys must be UPPER_SNAKE_CASE and values may contain only letters, numbers and . _ : / @ = , + ! -"
+  }
+}
+
+variable "backend_app_config" {
+  description = "Non-secret key/value settings for backend instances (written to /etc/oriel/deploy.env)."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for k, v in var.backend_app_config : can(regex("^[A-Z][A-Z0-9_]*$", k)) && can(regex("^[A-Za-z0-9._:/@=,+!-]*$", v))])
+    error_message = "Keys must be UPPER_SNAKE_CASE and values may contain only letters, numbers and . _ : / @ = , + ! -"
+  }
+}
+
+variable "backend_runtime_package" {
+  description = "Amazon Linux 2023 package that provides the Node.js runtime on backend instances (the application targets Node.js 22). Not yet verified on AWS."
+  type        = string
+  default     = "nodejs22"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9._+-]*$", var.backend_runtime_package))
+    error_message = "The package name may contain only lowercase letters, numbers and . _ + -"
+  }
 }
 
 ## Load balancer inputs. Health-check paths are owned by the ALB module, not configured here.

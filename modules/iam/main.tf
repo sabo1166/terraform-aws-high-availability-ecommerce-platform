@@ -81,3 +81,44 @@ resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
   role       = aws_iam_role.lambda.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
+
+## Per-tier EC2 roles and instance profiles. Each tier gets its own identity so the delivery module can grant the
+## frontend read access to its release prefix only and the backend read access to its prefix plus two secrets. Both
+## keep only the CloudWatch agent policy here; nothing in this module grants access to S3 or Secrets Manager.
+## The shared "ec2" role above is no longer used by the Auto Scaling Groups; it is kept so this change deletes
+## nothing, and can be removed in a later cleanup.
+locals {
+  instance_tiers = toset(["frontend", "backend"])
+}
+
+resource "aws_iam_role" "tier" {
+  for_each = local.instance_tiers
+
+  name_prefix        = "${var.project_name}-${var.environment}-${each.key}-ec2-"
+  description        = "Role assumed by ${each.key} application EC2 instances."
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-${each.key}-ec2-role"
+    Tier = each.key
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "tier_cloudwatch_agent" {
+  for_each = local.instance_tiers
+
+  role       = aws_iam_role.tier[each.key].name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+resource "aws_iam_instance_profile" "tier" {
+  for_each = local.instance_tiers
+
+  name_prefix = "${var.project_name}-${var.environment}-${each.key}-ec2-"
+  role        = aws_iam_role.tier[each.key].name
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-${each.key}-ec2-profile"
+    Tier = each.key
+  })
+}

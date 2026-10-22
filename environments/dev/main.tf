@@ -112,17 +112,57 @@ module "alb" {
 module "compute" {
   source = "../../modules/compute"
 
+  project_name                   = var.project_name
+  environment                    = var.environment
+  private_app_subnet_ids         = module.network.private_app_subnet_ids
+  frontend_security_group_id     = module.security.frontend_security_group_id
+  backend_security_group_id      = module.security.backend_security_group_id
+  frontend_instance_profile_name = module.iam.frontend_instance_profile_name
+  backend_instance_profile_name  = module.iam.backend_instance_profile_name
+  frontend_target_group_arn      = module.alb.frontend_target_group_arn
+  backend_target_group_arn       = module.alb.backend_target_group_arn
+  frontend                       = var.frontend
+  backend                        = var.backend
+  wait_for_capacity_timeout      = var.asg_wait_for_capacity_timeout
+
+  ## Non-secret settings for the deployment scripts. Secrets are referenced by ARN only and read at deploy time.
+  frontend_app_config = {
+    INTERNAL_ALB_DNS = module.alb.internal_alb_dns_name
+  }
+  backend_app_config = {
+    DB_HOST            = module.database.db_address
+    DB_PORT            = tostring(module.database.db_port)
+    DB_NAME            = module.database.db_name
+    DB_USER            = module.database.master_username
+    DB_SECRET_ARN      = module.database.master_user_secret_arn
+    JWT_SECRET_ARN     = module.delivery.jwt_secret_arn
+    CORS_ORIGINS       = "https://${var.domain_name}"
+    ARTIFACT_BUCKET    = module.delivery.artifact_bucket_name
+    CODEDEPLOY_APP     = module.delivery.codedeploy_app_name
+    AWS_DEFAULT_REGION = var.aws_region
+  }
+}
+
+## Create the artifact bucket, CodeDeploy application and deployment groups, instance read access, the JWT secret
+## container, and (when github_repository is set) the GitHub OIDC deploy role. No application is deployed.
+module "delivery" {
+  source = "../../modules/delivery"
+
   project_name               = var.project_name
   environment                = var.environment
-  private_app_subnet_ids     = module.network.private_app_subnet_ids
-  frontend_security_group_id = module.security.frontend_security_group_id
-  backend_security_group_id  = module.security.backend_security_group_id
-  instance_profile_name      = module.iam.ec2_instance_profile_name
-  frontend_target_group_arn  = module.alb.frontend_target_group_arn
-  backend_target_group_arn   = module.alb.backend_target_group_arn
-  frontend                   = var.frontend
-  backend                    = var.backend
-  wait_for_capacity_timeout  = var.asg_wait_for_capacity_timeout
+  frontend_asg_name          = module.compute.frontend_asg_name
+  backend_asg_name           = module.compute.backend_asg_name
+  frontend_target_group_name = module.alb.frontend_target_group_name
+  backend_target_group_name  = module.alb.backend_target_group_name
+  frontend_role_name         = module.iam.frontend_role_name
+  backend_role_name          = module.iam.backend_role_name
+  db_master_user_secret_arn  = module.database.master_user_secret_arn
+  unhealthy_host_alarm_names = module.monitoring.unhealthy_host_alarm_names
+  deployment_config_name     = var.deployment_config_name
+  enable_alarm_gating        = var.enable_deployment_alarm_gating
+  github_repository          = var.github_repository
+  github_environment         = var.github_environment
+  github_oidc_provider_arn   = var.github_oidc_provider_arn
 }
 
 ## Create the RDS MySQL database in the private database subnets.

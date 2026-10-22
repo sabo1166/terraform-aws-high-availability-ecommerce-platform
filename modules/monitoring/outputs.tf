@@ -13,3 +13,11 @@ output "alarm_names" {
   description = "Names of the CloudWatch alarms."
   value       = [for alarm in aws_cloudwatch_metric_alarm.this : alarm.alarm_name]
 }
+
+output "unhealthy_host_alarm_names" {
+  description = "Names of the unhealthy-host alarms per tier, used by the CodeDeploy deployment groups."
+  value = {
+    frontend = aws_cloudwatch_metric_alarm.this["frontend-unhealthy-hosts"].alarm_name
+    backend  = aws_cloudwatch_metric_alarm.this["backend-unhealthy-hosts"].alarm_name
+  }
+}

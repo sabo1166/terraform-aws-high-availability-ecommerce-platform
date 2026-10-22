@@ -79,3 +79,33 @@ output "health_monitor_function_name" {
   description = "Name of the target group health monitor Lambda function (null when disabled)."
   value       = module.automation.health_monitor_function_name
 }
+
+output "artifact_bucket_name" {
+  description = "Private S3 bucket that stores release bundles."
+  value       = module.delivery.artifact_bucket_name
+}
+
+output "codedeploy_app_name" {
+  description = "CodeDeploy application name."
+  value       = module.delivery.codedeploy_app_name
+}
+
+output "codedeploy_deployment_group_names" {
+  description = "CodeDeploy deployment group names by tier."
+  value       = module.delivery.deployment_group_names
+}
+
+output "backend_target_group_arn" {
+  description = "ARN of the backend target group (read-only health verification by the pipeline)."
+  value       = module.alb.backend_target_group_arn
+}
+
+output "jwt_secret_arn" {
+  description = "Secrets Manager secret for the JWT signing key; its value must be set outside Terraform before the first backend deployment."
+  value       = module.delivery.jwt_secret_arn
+}
+
+output "github_deploy_role_arn" {
+  description = "OIDC role GitHub Actions assumes to deploy; null when github_repository is not set."
+  value       = module.delivery.github_deploy_role_arn
+}
