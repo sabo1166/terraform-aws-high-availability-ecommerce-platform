@@ -36,6 +36,14 @@ Use `python -B` so `__pycache__` is not created.
 - Health-check paths are configured only in the ALB module.
 - Keep the alarm logger (`modules/automation/src/`) and the health monitor (`lambda/health-monitor/`) separate; the health monitor must stay read-only.
 
+## Application (`application/`)
+
+- `application/backend`: Fastify + TypeScript + Zod; `Store` interface with `MemoryStore` (tests, local) and `MysqlStore`; money is integer cents; prices, stock, and roles are decided only on the server; no default credentials (admin comes from the seed command with env-provided values); payment is a demo and no card data is ever accepted.
+- `application/frontend`: React + TypeScript + Vite, feature folders, a typed API client, cart persisted in `localStorage` and re-priced by the server, lazy 3D hero with an SVG fallback and reduced-motion support.
+- Checks: `npm run typecheck`, `npm test`, `npm run build` in each app (Node 22 per `.nvmrc`). Backend MySQL tests need `MYSQL_TEST_*` pointing at a throwaway database whose name ends in `_test`.
+- Do not claim the MySQL path or the browser UI works until they have actually been run (neither has been verified locally). Deployment is not implemented; see `docs/runbooks/application-deployment.md` before adding a deploy job.
+- Only the two workflow files `terraform.yml` and `application.yml` may exist; application pushes must never trigger `terraform apply`.
+
 ## Current state
 
-All 13 modules and `environments/dev` exist and validate locally. Not done: application code, CI workflows, remote state in use, HTTPS to the origin, per-tier IAM roles, scaling policies, Glue table. Several placeholder directories are empty.
+All 13 modules, `environments/dev`, and the Oriel application exist and validate/test locally. Not done: deploying the application (no mechanism in Terraform), remote state in use, HTTPS to the origin, per-tier IAM roles, scaling policies, Glue table, MySQL and browser verification. `lambda/automation` and a few test/doc directories are empty.

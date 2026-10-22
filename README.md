@@ -2,7 +2,20 @@
 
 Terraform for a two-tier, multi-AZ web platform on AWS.
 
-**Status: not deployed, not production-ready.** The Terraform passes local `fmt` and `validate`, and the Python tests pass with mocked AWS responses. Nothing has been planned, applied, or run on AWS. **No application code exists**; the EC2 bootstrap is a placeholder that installs nothing, and no health endpoint has been verified.
+**Status: not deployed, not production-ready.** The Terraform passes local `fmt` and `validate`, the Python tests pass with mocked AWS responses, and the **Oriel demo storefront and API** (`application/`) build and pass their local tests. Nothing has been planned, applied, or run on AWS, and **application deployment is not implemented**: the EC2 bootstrap is still a placeholder that installs nothing, and the Terraform defines no way to deliver the application to the private instances (see `docs/runbooks/application-deployment.md`).
+
+## The application: Oriel (demo store)
+
+`application/frontend` (React, TypeScript, Vite; lazy 3D hero with a static fallback) and `application/backend` (Fastify, TypeScript, Zod, MySQL or an in-memory store) implement a complete demo shop: catalogue with search, filters, sorting and pagination; product pages with variants and stock; persistent cart; server-priced checkout with transactional stock handling (demo payment only, no card data); customer accounts, order history; and a protected admin area for products, stock, and orders. Brand, products, prices, and policies are fictional.
+
+Run it locally without a database:
+
+```powershell
+cd application/backend;  npm ci; npm run dev     # API on :3000 (STORE=memory, seeded demo data)
+cd application/frontend; npm ci; npm run dev     # storefront on http://localhost:5173
+```
+
+Docs: `application/backend/README.md`, `application/frontend/README.md`, `docs/api/README.md`, `docs/architecture/application-architecture.md`. The MySQL store has not been run against a real database, and the UI has not been checked in a real browser (details in those READMEs).
 
 ## Architecture (as coded)
 
@@ -30,8 +43,10 @@ Route 53 -> CloudFront (+ ACM certificate, + WAF) -> Public ALB
 | `lambda/health-monitor/` | Source for the health monitor Lambda. |
 | `modules/automation/src/` | Source for the alarm logger Lambda. |
 | `tests/lambda/`, `modules/automation/tests/` | Python unit tests. |
-| `docs/reports/` | Audit report. |
-| `application/`, `lambda/automation/`, `tests/application/`, `tests/terraform/`, `docs/architecture/`, `docs/runbooks/`, `.github/workflows/` | Empty placeholders; not implemented. |
+| `application/frontend/`, `application/backend/` | The Oriel storefront and API (with deployment templates in each `deploy/`). |
+| `.github/workflows/` | `terraform.yml` and `application.yml`. |
+| `docs/` | `api/`, `architecture/`, `runbooks/`, `reports/` (audit). |
+| `lambda/automation/`, `tests/application/`, `tests/terraform/` | Empty placeholders; not implemented. |
 
 ## Required inputs for `environments/dev`
 
@@ -53,9 +68,15 @@ terraform validate
 cd ../..
 python -B -m unittest discover -s tests/lambda -v
 python -B -m unittest discover -s modules/automation/tests -v
+cd application/backend;  npm ci; npm run typecheck; npm test; npm run build; cd ../..
+cd application/frontend; npm ci; npm test; npm run build; cd ../..
 ```
 
 `validate` checks syntax and references only. It does not prove that resources can be created.
+
+## CI/CD
+
+Two GitHub Actions workflows exist in `.github/workflows/` (`terraform.yml` and `application.yml`). They have never run, and the repository variables, secrets, Environments, and the AWS access keys (IAM users) they need do not exist yet. Application deployment is not implemented. See `docs/runbooks/ci-cd.md`.
 
 ## Remote state
 
@@ -68,7 +89,7 @@ State is local until the backend is configured. `bootstrap/README.md` describes 
 
 ## Known limitations
 
-- No application, deployment pipeline, or CI workflow. Instances will fail load balancer health checks until an application serves the health-check path.
+- The application is not deployed: instances will fail load balancer health checks until the frontend and backend are installed on them. No deployment pipeline exists (the workflows have never run).
 - No remote state is configured for dev; the bootstrap stack is not applied.
 - Unrestricted security-group egress, a shared EC2 role for both tiers, no database secret access for the backend, no Auto Scaling policies, HTTP between CloudFront and the origin.
 - See `docs/reports/DEVOPS_PROJECT_AUDIT.md` for the full list.

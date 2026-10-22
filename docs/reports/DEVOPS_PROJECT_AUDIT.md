@@ -101,12 +101,12 @@ Application code and deployment artifacts; health endpoints; a real domain and h
 
 ## 10. Verdict
 
-- **Commit:** the initial state is committed (`c2ce9ae`); the P0 hardening below is uncommitted.
+- **Commit:** the Terraform platform, the P0 hardening, and the bootstrap state-bucket work are committed; the application, workflows, and later documentation were committed afterwards (see section 14).
 - **Deploy:** **not ready.** Nothing has been verified on AWS and no application exists.
 
-## 11. Local P0 hardening (after commit c2ce9ae)
+## 11. Local P0 hardening (after the first commit)
 
-Changes (code, uncommitted):
+Changes (code):
 
 - `environments/dev/versions.tf`: `required_version` raised to `>= 1.10.0` (the local Terraform is v1.16.2; the `aws ~> 5.100` and `archive ~> 2.7` constraints and the lock file are unchanged).
 - `environments/dev/variables.tf` and `main.tf`: new `asg_wait_for_capacity_timeout` (default `"0"`) passed to the compute module. The compute module default stays `10m`. ELB health checks and the grace period are unchanged; only Terraform's apply-time wait is disabled, so unhealthy targets are still reported by the alarms and the health monitor but no longer block `apply`. Set it back to a duration once an application serves the health-check path.
@@ -117,3 +117,62 @@ Changes (code, uncommitted):
 Local results (no AWS access): `terraform fmt -check -recursive` exit 0; Python tests 10 and 8, all OK (mocked); `init -backend=false` and `validate` for `environments/dev` and `bootstrap` in isolated copies both valid; the regenerated dev lock file is identical to the repository copy.
 
 Still open: bootstrap apply and backend configuration (needs approval and credentials), HTTPS to the origin, per-tier IAM roles, scaling policies, security-group egress, CI, application code. None of this has been verified on AWS.
+
+## 12. Application (Oriel demo store), added after the P0 hardening
+
+Code: `application/backend` (Fastify, TypeScript, Zod; memory and MySQL stores; migrations and seed), `application/frontend` (React, TypeScript, Vite; 3D hero with fallback), deployment templates (`application/frontend/deploy/nginx.conf.template`, `application/backend/deploy/oriel-backend.service`), `.github/workflows/application.yml` rewritten around the real code, and docs (`docs/api/`, `docs/architecture/application-architecture.md`, `docs/runbooks/application-deployment.md`, app READMEs).
+
+Local results (no AWS access):
+
+| Check | Result |
+| --- | --- |
+| Backend `tsc --noEmit`, `npm run build` | pass |
+| Backend `vitest run` | 60 passed, 12 skipped (the MySQL contract tests run only with `MYSQL_TEST_*`) |
+| Frontend `tsc --noEmit`, `npm run build` | pass (initial bundle 173 kB gzip; lazy 3D chunk 268 kB gzip) |
+| Frontend `vitest run` | 51 passed (jsdom, mocked API) |
+| HTTP smoke test: built backend (memory store) + `vite preview` proxy | home and SPA fallback 200; products via proxy; register, checkout (server price 19,200 cents incl. free delivery), account orders; customer 403 and admin 200 on `/admin/orders`; `/healthz` via proxy |
+| Workflow structure check (YAML, shell syntax, policy rules) | pass |
+
+Not verified (untested assumptions):
+
+- **`MysqlStore`, the SQL migration, and the migration runner have never run against a real MySQL server** (none available locally, Docker daemon not running). They are covered by contract tests written to run in CI against a MySQL 8.0 service container, which has not executed.
+- **No real-browser check**: layout at mobile/desktop widths, the 3D scene, animation, focus rings, console output, and the Report-Only CSP were not inspected; jsdom does not render CSS or WebGL.
+- Nginx template, systemd unit, `TRUST_PROXY=4`, and secret injection are untested on AWS. **No deployment mechanism exists** in Terraform; the application workflow therefore has no deploy job.
+
+New findings:
+
+| # | Severity | Finding | Evidence |
+| --- | --- | --- | --- |
+| 11 | High | The application cannot be delivered to the private instances: no artifact store, no Systems Manager/CodeDeploy, bootstrap installs nothing. | `modules/compute/templates`, `modules/iam/main.tf` |
+| 12 | High (untested) | MySQL store/migrations unverified; first real run may fail. | Section 12 above |
+| 13 | Medium | Backend cannot read the RDS-managed secret (no IAM grant) and the shared EC2 role would expose it to the frontend if granted. | `modules/iam`, `modules/database/README.md` |
+| 14 | Medium | Catalogue search/filter runs in memory per request; no caching (CloudFront caching disabled). Fine for a demo catalogue. | `application/backend/src/routes/catalog.ts` |
+| 15 | Low | Backend rate limits are per instance (in memory) and grow with instance count. | `application/backend/src/app.ts` |
+| 16 | Info | Payment is a demo; no card data accepted. Passwords use scrypt; roles are enforced server-side; admin accounts only via seeding. | tests in `application/backend/tests/api.test.ts` |
+
+## 13. MySQL and browser verification gate (after section 12)
+
+| Gate | Result |
+| --- | --- |
+| Real MySQL 8.0 run (migrations, seed, contract tests) | **Blocked, not run.** No MySQL server on this machine (only MySQL Workbench's client tools), no MySQL service or listener on 3306, Docker Desktop installed but stopped (WSL `docker-desktop` distro stopped), no software installed without approval. The 12 MySQL tests remain skipped. |
+| Real-browser checks (headless Chrome 155 over DevTools, built storefront + real backend, memory store) | **57/57 checks passed** after fixes (`application/frontend/e2e`, `npm run e2e`); screenshots reviewed. |
+| Frontend unit tests | 53 passed; backend 60 passed, 12 skipped |
+
+Defects found in the browser and fixed: first Tab skipped the skip link (focus moved to `<main>` on first load); sign-out redirected to login; mobile header search collapsed; icon buttons could shrink; hero headline wrapping; faceted 3D vase; three.js shadow-map deprecation warning. Remaining: `THREE.Clock` deprecation from `@react-three/fiber` (third party).
+
+Not verified: MySQL store, Firefox/Safari/devices, screen readers, contrast measurements, CSP, anything on AWS. Delivery design (SSM vs CodeDeploy, recommendation CodeDeploy) is in `docs/architecture/deployment-delivery-design.md`; no Terraform was changed.
+
+## 14. Pre-publication audit (before the first push)
+
+Checks run locally (no AWS, no remote backend, no Docker): `npm ci`, type check, tests and builds for the backend (60 passed, 12 skipped) and frontend (53 passed); `npm audit --audit-level=high` for both apps (0 vulnerabilities reported by the registry advisory database); `terraform fmt -check -recursive`; `terraform init -backend=false` plus `validate` for `environments/dev` and `bootstrap` in an isolated copy; the Python Lambda tests (10 and 8); the workflow structure and authentication checks.
+
+Fixed in this pass:
+
+- `environments/dev` did not pass health-check paths to the ALB module. It now passes `frontend_health_check_path` and `backend_health_check_path` (default `/healthz`, which both application tiers answer without touching the database).
+- Documentation that still described the work as uncommitted, and the runbooks that listed the health-path wiring as outstanding, were corrected.
+
+Not run: the 12 MySQL contract tests (no MySQL server on this machine and Docker was not started), the real-browser run (it needs the backend and preview servers; the last documented run was 57/57), and anything on AWS or GitHub Actions.
+
+Unresolved (needs credentials, a domain, a decision, or a real AWS account): application delivery to the private instances; per-tier IAM roles and database-secret access; HTTP between CloudFront and the origin; open public ALB and unrestricted security-group egress; no applied remote state; the plan and apply IAM users, GitHub secrets, variables and the `dev-apply` Environment; MySQL verification; scaling policies; a real domain and hosted zone for any `terraform plan` of the dev stack.
+
+`.serena/` is local tooling configuration, is ignored by `.gitignore`, and is intentionally not committed.
